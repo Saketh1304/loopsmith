@@ -1,6 +1,6 @@
 import pytest
 
-from loopsmith.llm import Message, ModelError
+from loopsmith.llm import Message, ModelError, ToolCall, ToolResult, ToolSpec
 from loopsmith.llm.gemini import GeminiClient, build_request_body, parse_reply
 
 
@@ -125,3 +125,118 @@ def test_list_models_keeps_only_text_generation_models():
 
     assert client.list_models() == ["alpha", "zeta"]
     assert transport.requests[0][0] == "GET"
+
+
+# --- Tool calling ---
+
+READ_SPEC = ToolSpec(
+    name="read_file",
+    description="Read a file.",
+    parameters={
+        "type": "object",
+        "properties": {"path": {"type": "string"}},
+        "required": ["path"],
+    },
+)
+
+# What Gemini sends when it wants a tool: a functionCall part that also
+# carries an encrypted thoughtSignature.
+FUNCTION_CALL_PARTS = [
+    {
+        "functionCall": {"name": "read_file", "args": {"path": "app.py"}},
+        "thoughtSignature": "SIGNATURE-A",
+    }
+]
+
+
+def test_tools_are_declared_in_the_request():
+    body = build_request_body([Message("user", "hi")], tools=[READ_SPEC])
+
+    assert body["tools"] == [
+        {
+            "functionDeclarations": [
+                {
+                    "name": "read_file",
+                    "description": "Read a file.",
+                    "parameters": READ_SPEC.parameters,
+                }
+            ]
+        }
+    ]
+
+
+def test_no_tools_key_when_no_tools_given():
+    assert "tools" not in build_request_body([Message("user", "hi")])
+
+
+def test_function_call_is_parsed_into_a_tool_call():
+    reply = parse_reply({"candidates": [{"content": {"parts": FUNCTION_CALL_PARTS}}]})
+
+    assert reply.text == ""
+    assert reply.tool_calls == (ToolCall("read_file", {"path": "app.py"}),)
+
+
+def test_thought_signature_survives_the_round_trip():
+    """Gemini returns HTTP 400 if a function call comes back without the
+    signature it was sent with, so the original parts are replayed as is."""
+    reply = parse_reply({"candidates": [{"content": {"parts": FUNCTION_CALL_PARTS}}]})
+    history = [
+        Message("user", "read app.py"),
+        reply.as_message(),
+        Message("tool", tool_results=(ToolResult("read_file", "print('hi')"),)),
+    ]
+
+    body = build_request_body(history)
+
+    assert body["contents"][1] == {"role": "model", "parts": FUNCTION_CALL_PARTS}
+
+
+def test_tool_results_are_sent_as_function_responses_in_a_user_turn():
+    results = (
+        ToolResult("read_file", "print('hi')", id="call-1"),
+        ToolResult("read_file", "File does not exist.", is_error=True),
+    )
+
+    body = build_request_body([Message("tool", tool_results=results)])
+
+    assert body["contents"] == [
+        {
+            "role": "user",
+            "parts": [
+                {
+                    "functionResponse": {
+                        "name": "read_file",
+                        "response": {"result": "print('hi')"},
+                        "id": "call-1",
+                    }
+                },
+                {
+                    "functionResponse": {
+                        "name": "read_file",
+                        "response": {"error": "File does not exist."},
+                    }
+                },
+            ],
+        }
+    ]
+
+
+def test_assistant_tool_calls_without_raw_parts_are_rebuilt():
+    message = Message("assistant", "Let me look.", (ToolCall("read_file", {"path": "a"}),))
+
+    body = build_request_body([message])
+
+    assert body["contents"][0] == {
+        "role": "model",
+        "parts": [
+            {"text": "Let me look."},
+            {"functionCall": {"name": "read_file", "args": {"path": "a"}}},
+        ],
+    }
+
+
+def test_empty_answer_reports_the_finish_reason():
+    body = {"candidates": [{"content": {}, "finishReason": "MALFORMED_FUNCTION_CALL"}]}
+
+    with pytest.raises(ModelError, match="MALFORMED_FUNCTION_CALL"):
+        parse_reply(body)

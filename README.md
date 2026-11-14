@@ -2,7 +2,20 @@
 
 A CLI coding agent built from scratch in Python.
 
-> Work in progress. It can talk to a model; the agent loop is being built.
+> Work in progress. The agent can explore and read a project. Editing
+> files and running commands come next.
+
+## What it does
+
+Run it inside any project folder and ask a question:
+
+```
+loopsmith "What does this project do, and where is the entry point?"
+```
+
+The agent lists folders and reads files as needed, showing each tool
+call as it happens, then prints its answer. It can only read files
+inside the folder it was started in.
 
 ## Setup
 
@@ -54,7 +67,12 @@ set `GEMINI_MODEL` in `.env` to one of the names it prints.
 ## Project layout
 
 ```
-src/loopsmith/   the agent's code
+src/loopsmith/
+  agent.py       the agent loop
+  cli.py         command-line entry point
+  config.py      API key and model settings
+  llm/           the model layer (provider-neutral types, Gemini client)
+  tools/         the actions the agent can take
 tests/           automated tests
 docs/            design decisions and notes
 ```

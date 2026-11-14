@@ -100,3 +100,82 @@ Each entry records a design choice, the alternatives, and the reason.
 - **Why:** `generateContent` is stateless: the full conversation is sent
   on every call. That makes the agent's state explicit and keeps the
   design close to other providers' APIs. Worth revisiting later.
+
+## 12. The loop stops when the model stops asking for tools
+
+- **Choice:** each step calls the model once. A reply with tool calls
+  means "keep going"; a reply with only text means "done".
+- **Alternatives:** a special `finish` tool the model must call; asking
+  the model "are you done?" after each step.
+- **Why:** it is the simplest rule and the one most agents use. A
+  `finish` tool gives a more structured result and may be worth adding
+  for the benchmark.
+
+## 13. A hard limit on steps
+
+- **Choice:** stop after `max_steps` model calls (default 20) and exit
+  with a failure code.
+- **Alternatives:** no limit; a time or cost budget.
+- **Why:** a model can loop forever, calling the same tool again and
+  again. Every step costs money and quota, so a run must be bounded.
+  A token or cost budget would be a good later addition.
+
+## 14. Tool failures go back to the model
+
+- **Choice:** an unknown tool, a bad argument or a crash inside a tool
+  becomes an error result that the model reads. The loop never raises
+  because of a tool.
+- **Alternatives:** stop the run on the first tool error.
+- **Why:** models often recover: they fix the path or try another tool.
+  Error messages are written for the model, saying what to do next.
+  Failures of the model API itself are different and do stop the run.
+
+## 15. All file access goes through a workspace check
+
+- **Choice:** every path is resolved (following `..` and symlinks) and
+  refused unless it lands inside the project folder. `.env` files are
+  refused as well.
+- **Alternatives:** trust the model's paths.
+- **Why:** tool arguments are untrusted input, like request parameters
+  in a web API. The model could be steered by text inside a file it
+  reads (prompt injection) into asking for private files. Whatever a
+  tool returns is also sent to the model provider, so secrets must not
+  be readable. This check is a first layer; the sandbox project adds
+  real isolation.
+
+## 16. Tool output is capped
+
+- **Choice:** file contents are cut at 40,000 characters and folder
+  listings at 200 entries, with a note saying what was left out.
+- **Alternatives:** return everything.
+- **Why:** the whole history is re-sent on every step, so one huge file
+  would be paid for again and again and could overflow the context
+  window. The note tells the model the output is incomplete.
+
+## 17. The provider's raw reply is kept and replayed
+
+- **Choice:** an assistant `Message` stores the provider's original
+  parts in `raw`, and `GeminiClient` sends them back unchanged.
+- **Alternatives:** rebuild the model's turn from the neutral fields.
+- **Why:** Gemini attaches an encrypted `thoughtSignature` to function
+  calls and rejects the next request with HTTP 400 if it is missing.
+  Keeping the raw parts preserves it without the agent loop needing to
+  know that signatures exist.
+- **Cost:** a history recorded with one provider cannot be replayed
+  through another without dropping `raw`.
+
+## 18. Tool activity goes to stderr, the answer to stdout
+
+- **Choice:** the trace of tool calls is printed to stderr and the final
+  answer to stdout.
+- **Alternatives:** print everything to stdout.
+- **Why:** it is the Unix convention. `loopsmith "..." > answer.txt`
+  captures only the answer, and the benchmark can read stdout cleanly.
+
+## 19. Read-only tools first
+
+- **Choice:** this step ships `list_files` and `read_file` only.
+- **Alternatives:** add file editing and shell commands at once.
+- **Why:** read-only tools cannot damage anything, so the loop can be
+  tested on a real model safely. Tools that change things arrive with
+  confirmation prompts in the next step.

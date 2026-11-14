@@ -1,17 +1,22 @@
 """Google Gemini, called over plain HTTP.
 
-API reference: https://ai.google.dev/gemini-api/docs/generate-content/text-generation
+API references:
+  https://ai.google.dev/gemini-api/docs/generate-content/text-generation
+  https://ai.google.dev/gemini-api/docs/generate-content/thought-signatures
 """
 
 from urllib.parse import quote
 
-from loopsmith.llm.base import Message, ModelError, ModelReply
+from loopsmith.llm.base import (
+    Message,
+    ModelError,
+    ModelReply,
+    ToolCall,
+    ToolSpec,
+)
 from loopsmith.llm.http import Transport, send_json
 
 BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
-
-# Gemini calls the assistant's role "model".
-_ROLE_NAMES = {"user": "user", "assistant": "model"}
 
 
 class GeminiClient:
@@ -22,10 +27,15 @@ class GeminiClient:
         self._model = model
         self._transport = transport
 
-    def generate(self, messages: list[Message], system: str | None = None) -> ModelReply:
+    def generate(
+        self,
+        messages: list[Message],
+        system: str | None = None,
+        tools: list[ToolSpec] | None = None,
+    ) -> ModelReply:
         url = f"{BASE_URL}/models/{quote(self._model, safe='')}:generateContent"
         status, body = self._transport(
-            "POST", url, self._headers(), build_request_body(messages, system)
+            "POST", url, self._headers(), build_request_body(messages, system, tools)
         )
         if status != 200:
             raise self._error(status, body)
@@ -56,8 +66,10 @@ class GeminiClient:
             )
         elif status == 429:
             hint = "Rate limit reached. Wait a minute and try again."
-        elif status in (400, 401, 403):
+        elif status in (401, 403):
             hint = "The request was rejected. Check that your API key is correct."
+        elif status == 400:
+            hint = "The server rejected the request as invalid."
         elif status >= 500:
             hint = "The model server had a problem. Try again shortly."
         else:
@@ -66,28 +78,88 @@ class GeminiClient:
         return ModelError(f"{hint} (HTTP {status}: {detail})", status, retryable)
 
 
-def build_request_body(messages: list[Message], system: str | None) -> dict:
+def build_request_body(
+    messages: list[Message],
+    system: str | None = None,
+    tools: list[ToolSpec] | None = None,
+) -> dict:
     """Translate our neutral messages into Gemini's JSON shape."""
-    body: dict = {
-        "contents": [
-            {"role": _ROLE_NAMES[message.role], "parts": [{"text": message.text}]}
-            for message in messages
-        ]
-    }
+    body: dict = {"contents": [_content_for(message) for message in messages]}
     if system:
         body["system_instruction"] = {"parts": [{"text": system}]}
+    if tools:
+        body["tools"] = [
+            {
+                "functionDeclarations": [
+                    {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.parameters,
+                    }
+                    for tool in tools
+                ]
+            }
+        ]
     return body
 
 
+def _content_for(message: Message) -> dict:
+    if message.role == "user":
+        return {"role": "user", "parts": [{"text": message.text}]}
+
+    if message.role == "assistant":
+        # Replay the model's own parts untouched when we have them. They
+        # can carry a `thoughtSignature`, and Gemini rejects the next
+        # request with HTTP 400 if a function call comes back without it.
+        if message.raw is not None:
+            return {"role": "model", "parts": message.raw}
+        parts: list[dict] = []
+        if message.text:
+            parts.append({"text": message.text})
+        for call in message.tool_calls:
+            parts.append({"functionCall": _with_id({"name": call.name, "args": call.args}, call.id)})
+        return {"role": "model", "parts": parts}
+
+    # role "tool": Gemini expects tool results in a "user" turn.
+    parts = []
+    for result in message.tool_results:
+        key = "error" if result.is_error else "result"
+        response = {"name": result.name, "response": {key: result.content}}
+        parts.append({"functionResponse": _with_id(response, result.id)})
+    return {"role": "user", "parts": parts}
+
+
+def _with_id(payload: dict, call_id: str | None) -> dict:
+    if call_id is not None:
+        payload["id"] = call_id
+    return payload
+
+
 def parse_reply(body: dict) -> ModelReply:
-    """Pull the answer text out of Gemini's response JSON."""
+    """Pull the answer text and any tool calls out of Gemini's response."""
     candidates = body.get("candidates", [])
     if not candidates:
         feedback = body.get("promptFeedback", {})
         raise ModelError(f"The model returned no answer. Feedback: {feedback}")
-    parts = candidates[0].get("content", {}).get("parts", [])
+
+    candidate = candidates[0]
+    parts = candidate.get("content", {}).get("parts", [])
+    if not parts:
+        reason = candidate.get("finishReason", "unknown")
+        raise ModelError(f"The model returned an empty answer (finish reason: {reason}).")
+
     # Skip "thought" parts: those are the model's reasoning, not its answer.
     text = "".join(
         part["text"] for part in parts if "text" in part and not part.get("thought")
     )
-    return ModelReply(text=text)
+    tool_calls = tuple(
+        ToolCall(
+            name=part["functionCall"].get("name", ""),
+            args=part["functionCall"].get("args") or {},
+            id=part["functionCall"].get("id"),
+        )
+        for part in parts
+        if "functionCall" in part
+    )
+    message = Message("assistant", text, tool_calls, raw=parts)
+    return ModelReply(text=text, tool_calls=tool_calls, message=message)

@@ -6,24 +6,80 @@ new class that satisfies `ModelClient`.
 """
 
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 
-Role = Literal["user", "assistant"]
+Role = Literal["user", "assistant", "tool"]
+
+
+@dataclass(frozen=True)
+class ToolSpec:
+    """Describes one tool to the model.
+
+    `parameters` is a JSON Schema object saying which arguments the tool
+    takes. The model reads the name, description and schema to decide
+    when and how to call the tool.
+    """
+
+    name: str
+    description: str
+    parameters: dict
+
+
+@dataclass(frozen=True)
+class ToolCall:
+    """The model asking for a tool to be run."""
+
+    name: str
+    args: dict
+    id: str | None = None
+
+
+@dataclass(frozen=True)
+class ToolResult:
+    """What happened when a tool was run, sent back to the model."""
+
+    name: str
+    content: str
+    is_error: bool = False
+    id: str | None = None
 
 
 @dataclass(frozen=True)
 class Message:
-    """One turn in the conversation."""
+    """One entry in the conversation history.
+
+    - role "user": text from the person.
+    - role "assistant": the model's turn, with text and/or tool calls.
+    - role "tool": the results of the tool calls in the previous turn.
+
+    `raw` holds the provider's own version of an assistant turn. Some
+    providers attach data that must be sent back unchanged (Gemini's
+    thought signatures), so the client stores the original here and
+    replays it as it was received.
+    """
 
     role: Role
-    text: str
+    text: str = ""
+    tool_calls: tuple[ToolCall, ...] = ()
+    tool_results: tuple[ToolResult, ...] = ()
+    raw: Any = None
 
 
 @dataclass(frozen=True)
 class ModelReply:
-    """What the model answered."""
+    """What the model answered.
+
+    `message` is the assistant turn to append to the history.
+    """
 
     text: str
+    tool_calls: tuple[ToolCall, ...] = ()
+    message: Message | None = None
+
+    def as_message(self) -> Message:
+        if self.message is not None:
+            return self.message
+        return Message("assistant", self.text, self.tool_calls)
 
 
 class ModelError(Exception):
@@ -47,6 +103,11 @@ class ModelClient(Protocol):
     declaring `implements`.
     """
 
-    def generate(self, messages: list[Message], system: str | None = None) -> ModelReply:
+    def generate(
+        self,
+        messages: list[Message],
+        system: str | None = None,
+        tools: list[ToolSpec] | None = None,
+    ) -> ModelReply:
         """Send the conversation so far and return the model's reply."""
         ...

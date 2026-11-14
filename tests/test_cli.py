@@ -2,12 +2,12 @@ import pytest
 
 from loopsmith.cli import SYSTEM_PROMPT, main
 from loopsmith.config import API_KEY_VAR
-from loopsmith.llm import Message, ModelError
+from loopsmith.llm import Message, ModelError, ToolCall
 from loopsmith.llm.fake import FakeClient
 
 
 class FailingClient:
-    def generate(self, messages, system=None):
+    def generate(self, messages, system=None, tools=None):
         raise ModelError("Rate limit reached.", status=429, retryable=True)
 
 
@@ -23,8 +23,38 @@ def test_sends_task_to_model_and_prints_reply(monkeypatch, tmp_path, capsys):
     exit_code = main(["say hello"], client=client)
 
     assert exit_code == 0
-    assert "Hello from the model" in capsys.readouterr().out
-    assert client.calls == [([Message("user", "say hello")], SYSTEM_PROMPT)]
+    assert capsys.readouterr().out.strip() == "Hello from the model"
+    history, system, tools = client.calls[0]
+    assert history == [Message("user", "say hello")]
+    assert system == SYSTEM_PROMPT
+    assert {tool.name for tool in tools} == {"list_files", "read_file"}
+
+
+def test_agent_reads_a_real_file_from_the_current_folder(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "notes.txt").write_text("the secret word is mango", encoding="utf-8")
+    client = FakeClient([ToolCall("read_file", {"path": "notes.txt"}), "The word is mango."])
+
+    exit_code = main(["what is the secret word?"], client=client)
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert captured.out.strip() == "The word is mango."
+    # The tool trace goes to stderr, keeping stdout clean.
+    assert "read_file(path='notes.txt')" in captured.err
+    # The model received the file's contents as the tool result.
+    tool_message = client.calls[1][0][-1]
+    assert tool_message.tool_results[0].content == "the secret word is mango"
+
+
+def test_hitting_the_step_limit_exits_with_failure(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    client = FakeClient([ToolCall("list_files", {}) for _ in range(5)])
+
+    exit_code = main(["loop", "--max-steps", "2"], client=client)
+
+    assert exit_code == 1
+    assert "Stopped after 2 steps" in capsys.readouterr().out
 
 
 def test_model_error_is_reported_cleanly(monkeypatch, tmp_path, capsys):
