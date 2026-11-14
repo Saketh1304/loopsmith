@@ -75,7 +75,24 @@ class GeminiClient:
         else:
             hint = "The request failed."
         retryable = status == 429 or status >= 500
-        return ModelError(f"{hint} (HTTP {status}: {detail})", status, retryable)
+        return ModelError(
+            f"{hint} (HTTP {status}: {detail})", status, retryable, _retry_delay(body)
+        )
+
+
+def _retry_delay(body: dict) -> float | None:
+    """Read the wait the server suggests, such as "retryDelay": "34s"."""
+    details = body.get("error", {}).get("details", [])
+    if not isinstance(details, list):
+        return None
+    for detail in details:
+        delay = detail.get("retryDelay") if isinstance(detail, dict) else None
+        if isinstance(delay, str) and delay.endswith("s"):
+            try:
+                return float(delay[:-1])
+            except ValueError:
+                return None
+    return None
 
 
 def build_request_body(

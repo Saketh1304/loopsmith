@@ -179,3 +179,99 @@ Each entry records a design choice, the alternatives, and the reason.
 - **Why:** read-only tools cannot damage anything, so the loop can be
   tested on a real model safely. Tools that change things arrive with
   confirmation prompts in the next step.
+
+## 20. Editing by exact text replacement
+
+- **Choice:** `edit_file` replaces one exact piece of text, which must
+  appear exactly once in the file. `write_file` handles new files and
+  full rewrites.
+- **Alternatives:** always rewrite the whole file; have the model
+  produce a unified diff; edit by line numbers.
+- **Why:** whole-file rewrites are slow and costly for large files, and
+  the model can silently drop lines. Models often get diff syntax and
+  line numbers wrong. Exact replacement is easy for a model to produce
+  and fails loudly: zero matches or several matches are both errors,
+  each with advice on how to fix the call.
+
+## 21. Line endings are preserved
+
+- **Choice:** files are matched with `\n` line endings and saved with
+  whatever style they had, `\n` or `\r\n`.
+- **Alternatives:** let Python translate line endings.
+- **Why:** the model writes `\n`, while Windows files often use `\r\n`.
+  Without this, edits would fail to match on Windows, or one small edit
+  would show up in git as every line changed.
+
+## 22. Changes need approval, and the loop enforces it
+
+- **Choice:** a tool that changes things provides a `preview` function.
+  Before running such a tool, the agent loop shows the preview (a diff
+  or the command) and asks an `approve` callback. Read-only tools run at
+  once.
+- **Alternatives:** each tool asks the user itself; no approval; approve
+  a whole plan up front.
+- **Why:** the rule lives in one place, so a new tool cannot forget it.
+  The loop does not know how approval is given: the CLI asks on the
+  terminal, tests pass a function, and the benchmark will approve
+  everything inside the sandbox.
+
+## 23. Approval fails closed
+
+- **Choice:** no approver configured means "no". No terminal to ask on
+  means "no". Any answer other than `y` or `yes` means "no". `--yes`
+  must be given to skip the questions.
+- **Alternatives:** default to allowing.
+- **Why:** when it is unclear whether a person agreed, the safe result
+  is to do nothing. A declined action goes back to the model as an
+  error telling it not to repeat the action.
+
+## 24. Shell commands: time limit, no stdin, no API key
+
+- **Choice:** `run_command` runs through the system shell in the project
+  folder, with a 60-second limit, with stdin closed, and with the model
+  API key removed from the environment.
+- **Alternatives:** an allowlist of permitted commands; no shell.
+- **Why:** a general shell is what makes the agent useful, since
+  projects differ in how they build and test. The limits handle the
+  common accidents: a hung command, a prompt waiting for input, and a
+  command that prints the environment.
+- **Known gaps:** a command can still do anything the user's account
+  can, including reaching files outside the project folder. On timeout,
+  processes started by the command may keep running. Approval is the
+  only guard today. The sandbox project exists to close these gaps.
+
+## 25. A failing command is a normal result
+
+- **Choice:** `run_command` returns the exit code and output whatever
+  the exit code is. Only a timeout is a tool error.
+- **Alternatives:** treat non-zero exit codes as errors.
+- **Why:** a failing test run is the most useful thing the agent can
+  read. It is information, not a malfunction.
+
+## 26. Long command output keeps both ends
+
+- **Choice:** output over 20,000 characters keeps the first and last
+  halves, with a note in the middle.
+- **Alternatives:** keep only the start, as `read_file` does.
+- **Why:** test summaries and error messages are usually at the end.
+
+## 27. Retries live in a wrapper around the client
+
+- **Choice:** `RetryingClient` wraps any `ModelClient` and retries
+  errors marked `retryable`, up to four attempts. It waits for the time
+  the server asks for, or else doubles the wait each time with a random
+  part added (exponential backoff with jitter).
+- **Alternatives:** retry inside `GeminiClient`; retry inside the agent
+  loop.
+- **Why:** this is the decorator pattern. Retrying works for every
+  provider without being rewritten, the agent loop stays simple, and
+  tests inject a fake `sleep` so they run instantly. Jitter stops many
+  clients that failed together from retrying at the same moment.
+
+## 28. The settings file is found by walking up the folders
+
+- **Choice:** `.env` is looked for in the current folder, then each
+  parent, then `~/.loopsmith.env`.
+- **Alternatives:** only the current folder.
+- **Why:** the agent is run inside other projects and their subfolders,
+  and should not need a copy of the key in each one.

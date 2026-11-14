@@ -240,3 +240,30 @@ def test_empty_answer_reports_the_finish_reason():
 
     with pytest.raises(ModelError, match="MALFORMED_FUNCTION_CALL"):
         parse_reply(body)
+
+
+def test_rate_limit_error_carries_the_servers_retry_delay():
+    body = {
+        "error": {
+            "message": "Quota exceeded",
+            "details": [
+                {"@type": "type.googleapis.com/google.rpc.Help"},
+                {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "34s"},
+            ],
+        }
+    }
+    client = GeminiClient("key", "some-model", RecordingTransport(429, body))
+
+    with pytest.raises(ModelError) as error_info:
+        client.generate([Message("user", "hello")])
+
+    assert error_info.value.retry_after == 34.0
+
+
+def test_error_without_retry_info_has_no_retry_delay():
+    client = GeminiClient("key", "m", RecordingTransport(503, {"error": {"message": "x"}}))
+
+    with pytest.raises(ModelError) as error_info:
+        client.generate([Message("user", "hello")])
+
+    assert error_info.value.retry_after is None

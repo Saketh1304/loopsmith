@@ -114,3 +114,87 @@ def test_observer_sees_every_tool_call():
     ).run("Say hi")
 
     assert seen == [("echo", "echo: hi")]
+
+
+# --- Approval ---
+
+
+def changing_tool(log: list) -> Tool:
+    """A tool that needs approval and records when it really runs."""
+
+    def run(args):
+        log.append(args)
+        return "changed"
+
+    def preview(args):
+        if "target" not in args:
+            raise ToolError("Missing required argument 'target'.")
+        return f"Change {args['target']}"
+
+    return Tool("change", "changes things", {"type": "object"}, run=run, preview=preview)
+
+
+def test_approved_action_runs():
+    ran, asked = [], []
+    client = FakeClient([ToolCall("change", {"target": "a.py"}), "Done."])
+
+    def approve(call, preview):
+        asked.append(preview)
+        return True
+
+    Agent(client, tools=[changing_tool(ran)], approve=approve).run("Change a.py")
+
+    assert asked == ["Change a.py"]
+    assert ran == [{"target": "a.py"}]
+    assert client.calls[1][0][-1].tool_results[0].content == "changed"
+
+
+def test_declined_action_does_not_run_and_the_model_is_told():
+    ran = []
+    client = FakeClient([ToolCall("change", {"target": "a.py"}), "Understood."])
+
+    result = Agent(
+        client, tools=[changing_tool(ran)], approve=lambda call, preview: False
+    ).run("Change a.py")
+
+    assert ran == []
+    declined = client.calls[1][0][-1].tool_results[0]
+    assert declined.is_error is True
+    assert "declined" in declined.content
+    assert result.text == "Understood."
+
+
+def test_without_an_approver_changing_tools_are_refused():
+    ran = []
+    client = FakeClient([ToolCall("change", {"target": "a.py"}), "Understood."])
+
+    Agent(client, tools=[changing_tool(ran)]).run("Change a.py")
+
+    assert ran == []
+    assert client.calls[1][0][-1].tool_results[0].is_error is True
+
+
+def test_invalid_arguments_fail_before_the_user_is_asked():
+    ran, asked = [], []
+    client = FakeClient([ToolCall("change", {}), "Understood."])
+
+    def approve(call, preview):
+        asked.append(preview)
+        return True
+
+    Agent(client, tools=[changing_tool(ran)], approve=approve).run("Change something")
+
+    assert asked == []
+    assert ran == []
+    assert "target" in client.calls[1][0][-1].tool_results[0].content
+
+
+def test_read_only_tools_never_ask_for_approval():
+    asked = []
+    client = FakeClient([ToolCall("echo", {"text": "hi"}), "Done."])
+
+    Agent(
+        client, tools=[echo_tool()], approve=lambda call, preview: asked.append(preview)
+    ).run("Say hi")
+
+    assert asked == []

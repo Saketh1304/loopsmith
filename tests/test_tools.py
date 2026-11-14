@@ -1,11 +1,12 @@
 import pytest
 
-from loopsmith.tools import ToolError, Workspace
+from loopsmith.tools import ToolError, Workspace, default_tools
 from loopsmith.tools.files import (
     MAX_FILE_CHARS,
-    default_tools,
+    edit_file_tool,
     list_files_tool,
     read_file_tool,
+    write_file_tool,
 )
 
 
@@ -105,5 +106,137 @@ def test_list_files_missing_folder(workspace):
 def test_tool_specs_describe_the_tools(workspace):
     specs = {tool.name: tool.spec for tool in default_tools(workspace)}
 
-    assert set(specs) == {"list_files", "read_file"}
+    assert set(specs) == {"list_files", "read_file", "edit_file", "write_file", "run_command"}
     assert specs["read_file"].parameters["required"] == ["path"]
+
+
+# --- Tools that change files ---
+
+
+def read_bytes(workspace, name: str) -> bytes:
+    return (workspace.root / name).read_bytes()
+
+
+def test_changing_tools_need_approval_and_reading_tools_do_not(workspace):
+    needs = {tool.name: tool.needs_approval for tool in default_tools(workspace)}
+
+    assert needs == {
+        "list_files": False,
+        "read_file": False,
+        "edit_file": True,
+        "write_file": True,
+        "run_command": True,
+    }
+
+
+def test_write_file_creates_a_file_and_its_folders(workspace):
+    result = write_file_tool(workspace).run({"path": "docs/new/notes.md", "content": "a\nb\n"})
+
+    assert read_bytes(workspace, "docs/new/notes.md") == b"a\nb\n"
+    assert "Created docs/new/notes.md (2 lines)" in result
+
+
+def test_write_file_overwrites_and_says_so(workspace):
+    result = write_file_tool(workspace).run({"path": "app.py", "content": "print('bye')\n"})
+
+    assert read_bytes(workspace, "app.py") == b"print('bye')\n"
+    assert result.startswith("Overwrote app.py")
+
+
+def test_write_file_preview_shows_a_diff_without_writing(workspace):
+    preview = write_file_tool(workspace).preview({"path": "app.py", "content": "print('bye')\n"})
+
+    assert preview.startswith("Overwrite file app.py")
+    assert "-print('hi')" in preview
+    assert "+print('bye')" in preview
+    assert read_bytes(workspace, "app.py") == b"print('hi')\n"
+
+
+def test_write_file_allows_empty_content(workspace):
+    write_file_tool(workspace).run({"path": "empty.txt", "content": ""})
+
+    assert read_bytes(workspace, "empty.txt") == b""
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("../outside.txt", "outside the workspace"),
+        (".env", "secrets"),
+        (".git/config", ".git"),
+        ("src", "folder"),
+    ],
+)
+def test_write_file_refuses_unsafe_targets(workspace, path, expected):
+    tool = write_file_tool(workspace)
+
+    with pytest.raises(ToolError, match=expected):
+        tool.preview({"path": path, "content": "x"})
+    with pytest.raises(ToolError, match=expected):
+        tool.run({"path": path, "content": "x"})
+
+
+def test_edit_file_replaces_the_one_matching_piece(workspace):
+    (workspace.root / "calc.py").write_bytes(b"def add(a, b):\n    return a - b\n")
+
+    result = edit_file_tool(workspace).run(
+        {"path": "calc.py", "old_text": "return a - b", "new_text": "return a + b"}
+    )
+
+    assert read_bytes(workspace, "calc.py") == b"def add(a, b):\n    return a + b\n"
+    assert result == "Edited calc.py."
+
+
+def test_edit_file_preview_shows_a_diff_without_writing(workspace):
+    preview = edit_file_tool(workspace).preview(
+        {"path": "app.py", "old_text": "hi", "new_text": "hello"}
+    )
+
+    assert preview.startswith("Edit file app.py")
+    assert "-print('hi')" in preview
+    assert "+print('hello')" in preview
+    assert read_bytes(workspace, "app.py") == b"print('hi')\n"
+
+
+def test_edit_file_keeps_windows_line_endings(workspace):
+    (workspace.root / "win.py").write_bytes(b"a = 1\r\nb = 2\r\nc = 3\r\n")
+
+    # The model writes "\n"; the file uses "\r\n". The edit must still
+    # match, and untouched lines must keep their endings.
+    edit_file_tool(workspace).run(
+        {"path": "win.py", "old_text": "a = 1\nb = 2", "new_text": "a = 10\nb = 20"}
+    )
+
+    assert read_bytes(workspace, "win.py") == b"a = 10\r\nb = 20\r\nc = 3\r\n"
+
+
+def test_edit_file_can_delete_text(workspace):
+    (workspace.root / "t.txt").write_bytes(b"keep remove keep\n")
+
+    edit_file_tool(workspace).run({"path": "t.txt", "old_text": " remove", "new_text": ""})
+
+    assert read_bytes(workspace, "t.txt") == b"keep keep\n"
+
+
+def test_edit_file_fails_when_text_is_not_found(workspace):
+    with pytest.raises(ToolError, match="not found"):
+        edit_file_tool(workspace).run({"path": "app.py", "old_text": "nope", "new_text": "x"})
+
+
+def test_edit_file_fails_when_text_is_ambiguous(workspace):
+    (workspace.root / "dup.py").write_bytes(b"x = 1\nx = 1\n")
+
+    with pytest.raises(ToolError, match="appears 2 times"):
+        edit_file_tool(workspace).run({"path": "dup.py", "old_text": "x = 1", "new_text": "x = 2"})
+
+    assert read_bytes(workspace, "dup.py") == b"x = 1\nx = 1\n"
+
+
+def test_edit_file_on_missing_file_points_to_write_file(workspace):
+    with pytest.raises(ToolError, match="write_file"):
+        edit_file_tool(workspace).run({"path": "nope.py", "old_text": "a", "new_text": "b"})
+
+
+def test_edit_file_refuses_secrets_file(workspace):
+    with pytest.raises(ToolError, match="secrets"):
+        edit_file_tool(workspace).run({"path": ".env", "old_text": "secret", "new_text": "x"})

@@ -87,12 +87,20 @@ class ModelError(Exception):
 
     `status` is the HTTP status code, or None for a network failure.
     `retryable` says whether trying again later could succeed.
+    `retry_after` is how many seconds the server asked us to wait, if it said.
     """
 
-    def __init__(self, message: str, status: int | None = None, retryable: bool = False):
+    def __init__(
+        self,
+        message: str,
+        status: int | None = None,
+        retryable: bool = False,
+        retry_after: float | None = None,
+    ):
         super().__init__(message)
         self.status = status
         self.retryable = retryable
+        self.retry_after = retry_after
 
 
 class ModelClient(Protocol):

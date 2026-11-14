@@ -17,13 +17,35 @@ class ConfigError(Exception):
     """Raised when a required setting is missing."""
 
 
-def load_env_file(path: Path = Path(".env")) -> None:
+HOME_ENV_FILE = ".loopsmith.env"
+
+
+def find_env_file(start: Path | None = None) -> Path | None:
+    """Locate the settings file.
+
+    Looks for ".env" in the starting folder and then in each parent
+    folder, so the agent works from a subfolder of a project. Falls back
+    to ".loopsmith.env" in the user's home folder, which lets the agent
+    run inside any project on the machine.
+    """
+    folder = (start or Path.cwd()).resolve()
+    for candidate in (folder, *folder.parents):
+        if (candidate / ".env").is_file():
+            return candidate / ".env"
+    home_file = Path.home() / HOME_ENV_FILE
+    return home_file if home_file.is_file() else None
+
+
+def load_env_file(path: Path | None = None) -> None:
     """Load KEY=VALUE lines from a file into the process environment.
 
-    A variable that is already set in the real environment wins over the
+    With no path given, the file is located by `find_env_file`. A
+    variable that is already set in the real environment wins over the
     file, so a deployed setup can override local defaults.
     """
-    if not path.is_file():
+    if path is None:
+        path = find_env_file()
+    if path is None or not path.is_file():
         return
     for raw_line in path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
@@ -42,7 +64,8 @@ def get_api_key() -> str:
     if not key:
         raise ConfigError(
             f"{API_KEY_VAR} is not set. Copy .env.example to .env and "
-            "put your key in it."
+            "put your key in it, or put it in ~/.loopsmith.env to use "
+            "loopsmith in any folder."
         )
     return key
 

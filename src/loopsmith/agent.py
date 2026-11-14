@@ -18,8 +18,17 @@ from loopsmith.tools.base import Tool, ToolError
 
 DEFAULT_MAX_STEPS = 20
 
+DECLINED_MESSAGE = (
+    "The user declined this action, so it was not carried out. Do not try "
+    "the same action again. Continue another way, or stop and explain."
+)
+
 # Called once for each tool call, after it has run.
 ToolObserver = Callable[[ToolCall, ToolResult], None]
+
+# Asked before a tool that changes things runs. Receives the call and a
+# description of what it will do; returns True to allow it.
+Approver = Callable[[ToolCall, str], bool]
 
 
 @dataclass(frozen=True)
@@ -37,12 +46,14 @@ class Agent:
         system: str | None = None,
         max_steps: int = DEFAULT_MAX_STEPS,
         on_tool: ToolObserver | None = None,
+        approve: Approver | None = None,
     ):
         self._client = client
         self._tools = {tool.name: tool for tool in tools}
         self._system = system
         self._max_steps = max_steps
         self._on_tool = on_tool
+        self._approve = approve
 
     def run(self, task: str) -> AgentResult:
         messages = [Message("user", task)]
@@ -77,7 +88,10 @@ class Agent:
             result = self._error(call, f"Unknown tool '{call.name}'. Available tools: {known}.")
         else:
             try:
-                result = ToolResult(call.name, tool.run(call.args), id=call.id)
+                if tool.needs_approval and not self._is_approved(tool, call):
+                    result = self._error(call, DECLINED_MESSAGE)
+                else:
+                    result = ToolResult(call.name, tool.run(call.args), id=call.id)
             except ToolError as error:
                 result = self._error(call, str(error))
             except Exception as error:  # a bug in a tool must not kill the loop
@@ -86,6 +100,17 @@ class Agent:
         if self._on_tool is not None:
             self._on_tool(call, result)
         return result
+
+    def _is_approved(self, tool: Tool, call: ToolCall) -> bool:
+        """Ask the approver. With no approver configured, the answer is no.
+
+        Building the preview also validates the arguments, so a bad call
+        raises ToolError here and the user is never asked about it.
+        """
+        preview = tool.preview(call.args)
+        if self._approve is None:
+            return False
+        return self._approve(call, preview)
 
     @staticmethod
     def _error(call: ToolCall, message: str) -> ToolResult:

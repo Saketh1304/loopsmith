@@ -1,6 +1,13 @@
 import pytest
 
-from loopsmith.config import API_KEY_VAR, ConfigError, get_api_key, load_env_file
+from loopsmith.config import (
+    API_KEY_VAR,
+    HOME_ENV_FILE,
+    ConfigError,
+    find_env_file,
+    get_api_key,
+    load_env_file,
+)
 
 
 def test_env_file_values_are_loaded(tmp_path, monkeypatch):
@@ -55,3 +62,55 @@ def test_model_name_defaults_when_unset_or_empty(monkeypatch):
 
     monkeypatch.setenv(MODEL_VAR, "custom-model")
     assert get_model_name() == "custom-model"
+
+
+# --- Locating the settings file ---
+
+
+@pytest.fixture
+def fake_home(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    return home
+
+
+def test_env_file_is_found_in_the_starting_folder(tmp_path, fake_home):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".env").write_text("A=1\n")
+
+    assert find_env_file(project) == project / ".env"
+
+
+def test_env_file_is_found_in_a_parent_folder(tmp_path, fake_home):
+    project = tmp_path / "project"
+    deep = project / "examples" / "demo"
+    deep.mkdir(parents=True)
+    (project / ".env").write_text("A=1\n")
+
+    assert find_env_file(deep) == project / ".env"
+
+
+def test_home_file_is_the_fallback(tmp_path, fake_home):
+    project = tmp_path / "project"
+    project.mkdir()
+    (fake_home / HOME_ENV_FILE).write_text("A=1\n")
+
+    assert find_env_file(project) == fake_home / HOME_ENV_FILE
+
+
+def test_project_file_wins_over_home_file(tmp_path, fake_home):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".env").write_text("A=1\n")
+    (fake_home / HOME_ENV_FILE).write_text("A=2\n")
+
+    assert find_env_file(project) == project / ".env"
+
+
+def test_no_file_anywhere_returns_none(tmp_path, fake_home):
+    project = tmp_path / "project"
+    project.mkdir()
+
+    assert find_env_file(project) is None
