@@ -275,3 +275,17 @@ Each entry records a design choice, the alternatives, and the reason.
 - **Alternatives:** only the current folder.
 - **Why:** the agent is run inside other projects and their subfolders,
   and should not need a copy of the key in each one.
+
+## 29. CI runs on Windows as well as Linux
+
+- **Choice:** the test workflow runs on `ubuntu-latest` and
+  `windows-latest`, each with Python 3.11 and 3.13.
+- **Alternatives:** Linux only.
+- **Why:** this came from a real failure. Three tests passed on Linux
+  and failed on Windows. A test fixture created its file with
+  `write_text`, which writes `\r\n` line endings on Windows, and the
+  tests then compared exact bytes expecting `\n`. The tool was right
+  (it kept the file's `\r\n` endings); the tests were wrong. Linux-only
+  CI could not see it. The fixture now writes exact bytes, and CI runs
+  on both systems so that a platform difference fails before it is
+  merged.

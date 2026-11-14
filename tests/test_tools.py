@@ -14,9 +14,11 @@ from loopsmith.tools.files import (
 def workspace(tmp_path):
     project = tmp_path / "project"
     project.mkdir()
-    (project / "app.py").write_text("print('hi')\n", encoding="utf-8")
+    # write_bytes, not write_text: on Windows, write_text turns "\n" into
+    # "\r\n", and these tests check the exact bytes on disk.
+    (project / "app.py").write_bytes(b"print('hi')\n")
     (project / "src").mkdir()
-    (project / "src" / "util.py").write_text("x = 1\n", encoding="utf-8")
+    (project / "src" / "util.py").write_bytes(b"x = 1\n")
     (project / ".git").mkdir()
     (project / ".env").write_text("GEMINI_API_KEY=secret\n", encoding="utf-8")
     (project / ".env.example").write_text("GEMINI_API_KEY=\n", encoding="utf-8")
@@ -150,6 +152,14 @@ def test_write_file_preview_shows_a_diff_without_writing(workspace):
     assert "-print('hi')" in preview
     assert "+print('bye')" in preview
     assert read_bytes(workspace, "app.py") == b"print('hi')\n"
+
+
+def test_write_file_keeps_windows_line_endings_when_overwriting(workspace):
+    (workspace.root / "win.py").write_bytes(b"a = 1\r\nb = 2\r\n")
+
+    write_file_tool(workspace).run({"path": "win.py", "content": "a = 10\nb = 20\n"})
+
+    assert read_bytes(workspace, "win.py") == b"a = 10\r\nb = 20\r\n"
 
 
 def test_write_file_allows_empty_content(workspace):
