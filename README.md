@@ -5,26 +5,41 @@ beyond the standard library.
 
 Give it a task inside a project folder. It reads the code, edits files,
 runs commands and tests, and keeps going until the task is done. It asks
-before every change. A session looks like this (illustrative):
+before every change.
+
+A real session, fixing the bug in `examples/buggy_stats` with Gemini
+(the final answer is shortened here):
 
 ```
-$ loopsmith "The tests are failing. Find the bug and fix it."
-  -> list_files()  [48 chars]
-  -> run_command(command='pytest')  [912 chars]
-  -> read_file(path='stats.py')  [861 chars]
+> loopsmith "The tests are failing. Find the bug and fix it."
+  -> list_files()  [43 chars]
+
+Run command: pytest
+Allow? [y/N] y
+  -> run_command(command='pytest')  [915 chars]
+  -> read_file(path='stats.py')  [905 chars]
+  -> read_file(path='test_stats.py')  [425 chars]
 
 Edit file stats.py
 --- a/stats.py
 +++ b/stats.py
-@@ -17,3 +17,3 @@
+@@ -16,7 +16,7 @@
+     middle = len(ordered) // 2
      if len(ordered) % 2 == 1:
          return ordered[middle]
 -    return (ordered[middle] + ordered[middle + 1]) / 2
 +    return (ordered[middle - 1] + ordered[middle]) / 2
+ 
+ 
+ def value_range(numbers: list[float]) -> float:
 Allow? [y/N] y
-  -> edit_file(path='stats.py', ...)  [16 chars]
-  -> run_command(command='pytest')  [164 chars]
-Fixed the median calculation for even-length lists. All 5 tests pass.
+  -> edit_file(path='stats.py', old_text='...', new_text='...')  [16 chars]
+
+Run command: pytest
+Allow? [y/N] y
+  -> run_command(command='pytest')  [411 chars]
+  -> read_file(path='stats.py')  [905 chars]
+I found and fixed the bug in `stats.py`. [...] All 5 tests are now passing.
 ```
 
 ## How it works
