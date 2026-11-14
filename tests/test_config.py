@@ -42,3 +42,16 @@ def test_missing_key_raises_helpful_error(monkeypatch):
 
     with pytest.raises(ConfigError, match=".env.example"):
         get_api_key()
+
+
+def test_model_name_defaults_when_unset_or_empty(monkeypatch):
+    from loopsmith.config import DEFAULT_MODEL, MODEL_VAR, get_model_name
+
+    monkeypatch.delenv(MODEL_VAR, raising=False)
+    assert get_model_name() == DEFAULT_MODEL
+
+    monkeypatch.setenv(MODEL_VAR, "  ")
+    assert get_model_name() == DEFAULT_MODEL
+
+    monkeypatch.setenv(MODEL_VAR, "custom-model")
+    assert get_model_name() == "custom-model"

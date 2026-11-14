@@ -2,7 +2,7 @@
 
 A CLI coding agent built from scratch in Python.
 
-> Work in progress. The setup works; the agent loop is being built.
+> Work in progress. It can talk to a model; the agent loop is being built.
 
 ## Setup
 
@@ -46,7 +46,10 @@ loopsmith "say hello"
 ```
 
 `pytest` should report all tests passing, and `loopsmith` should print
-`Setup OK`.
+the model's reply.
+
+If you get a "model not found" error, run `loopsmith --list-models` and
+set `GEMINI_MODEL` in `.env` to one of the names it prints.
 
 ## Project layout
 

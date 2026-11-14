@@ -9,6 +9,8 @@ import os
 from pathlib import Path
 
 API_KEY_VAR = "GEMINI_API_KEY"
+MODEL_VAR = "GEMINI_MODEL"
+DEFAULT_MODEL = "gemini-3.5-flash"
 
 
 class ConfigError(Exception):
@@ -43,3 +45,8 @@ def get_api_key() -> str:
             "put your key in it."
         )
     return key
+
+
+def get_model_name() -> str:
+    """Return the model to use: GEMINI_MODEL if set, else the default."""
+    return os.environ.get(MODEL_VAR, "").strip() or DEFAULT_MODEL
