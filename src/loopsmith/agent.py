@@ -15,11 +15,24 @@ from typing import Callable
 
 from loopsmith.context import (
     DEFAULT_CONTEXT_BUDGET,
+    SUMMARY_SYSTEM_PROMPT,
+    SummaryReport,
     TrimReport,
+    split_history,
+    summary_request,
+    task_message,
     trim_history,
     trim_target,
+    worth_summarising,
 )
-from loopsmith.llm.base import Message, ModelClient, ToolCall, ToolResult, Usage
+from loopsmith.llm.base import (
+    Message,
+    ModelClient,
+    ModelError,
+    ToolCall,
+    ToolResult,
+    Usage,
+)
 from loopsmith.tools.base import Tool, ToolError
 
 DEFAULT_MAX_STEPS = 20
@@ -42,6 +55,9 @@ UsageObserver = Callable[[int, Usage], None]
 
 # Called each time old tool output was trimmed from the history.
 TrimObserver = Callable[[TrimReport], None]
+
+# Called each time the agent summarised old history, or tried and failed.
+SummaryObserver = Callable[[SummaryReport], None]
 
 
 @dataclass(frozen=True)
@@ -66,6 +82,7 @@ class Agent:
         on_usage: UsageObserver | None = None,
         context_budget: int | None = DEFAULT_CONTEXT_BUDGET,
         on_trim: TrimObserver | None = None,
+        on_summary: SummaryObserver | None = None,
     ):
         self._client = client
         self._tools = {tool.name: tool for tool in tools}
@@ -74,14 +91,17 @@ class Agent:
         self._on_tool = on_tool
         self._approve = approve
         self._on_usage = on_usage
-        self._context_budget = context_budget  # None or 0 turns trimming off
+        # None or 0 turns trimming and summarising off.
+        self._context_budget = context_budget
         self._on_trim = on_trim
+        self._on_summary = on_summary
 
     def run(self, task: str) -> AgentResult:
-        messages = [Message("user", task)]
+        messages = [task_message(task)]
         specs = [tool.spec for tool in self._tools.values()]
         total = Usage()
         context_tokens = 0
+        summary = ""  # the latest summary of old history, if one was made
 
         for step in range(1, self._max_steps + 1):
             reply = self._client.generate(messages, system=self._system, tools=specs)
@@ -108,11 +128,17 @@ class Agent:
             results = tuple(self._run_tool(call) for call in reply.tool_calls)
             messages.append(Message("tool", tool_results=results))
 
-            # Trim only on a fresh measurement. With no token count from
+            # Shrink only on a fresh measurement. With no token count from
             # the provider the history size is unknown, and it is left
             # alone.
-            if reply.usage is not None:
-                messages = self._trim_if_over_budget(messages, reply.usage.input_tokens)
+            if reply.usage is not None and self._context_budget:
+                tokens = reply.usage.input_tokens
+                messages, tokens = self._trim_if_over_budget(messages, tokens)
+                if tokens > self._context_budget:
+                    # Trimming was not enough. Summarising costs one more
+                    # model call, and that call is counted in the total.
+                    messages, summary, cost = self._summarise(messages, task, summary)
+                    total = total + cost
 
         return AgentResult(
             text=f"Stopped after {self._max_steps} steps without finishing.",
@@ -122,15 +148,57 @@ class Agent:
             context_tokens=context_tokens,
         )
 
-    def _trim_if_over_budget(self, messages: list[Message], tokens: int) -> list[Message]:
-        """Trim old tool output once the last request passed the budget."""
+    def _trim_if_over_budget(
+        self, messages: list[Message], tokens: int
+    ) -> tuple[list[Message], int]:
+        """Trim old tool output once the last request passed the budget.
+
+        Returns the history and its estimated size after trimming.
+        """
         budget = self._context_budget
         if not budget or tokens <= budget:
-            return messages
+            return messages, tokens
         trimmed, report = trim_history(messages, tokens - trim_target(budget))
         if report.results_trimmed and self._on_trim is not None:
             self._on_trim(report)
-        return trimmed
+        return trimmed, tokens - report.tokens_freed
+
+    def _summarise(
+        self, messages: list[Message], task: str, summary: str
+    ) -> tuple[list[Message], str, Usage]:
+        """Replace the older part of the history with a summary.
+
+        Returns the history, the summary now in force, and what the extra
+        model call cost. Summarising only saves tokens; the run does not
+        depend on it. So if the call fails, the history is returned as it
+        was and the run goes on.
+        """
+        old, recent = split_history(messages)
+        if not worth_summarising(old, self._context_budget or 0):
+            return messages, summary, Usage()
+
+        try:
+            reply = self._client.generate(
+                summary_request(task, summary, old), system=SUMMARY_SYSTEM_PROMPT
+            )
+        except ModelError as error:
+            self._report_summary(SummaryReport(error=str(error)))
+            return messages, summary, Usage()
+
+        cost = reply.usage or Usage()
+        new_summary = reply.text.strip()
+        if not new_summary:
+            self._report_summary(
+                SummaryReport(usage=reply.usage, error="the model returned an empty summary")
+            )
+            return messages, summary, cost
+
+        self._report_summary(SummaryReport(messages_replaced=len(old), usage=reply.usage))
+        return [task_message(task, new_summary), *recent], new_summary, cost
+
+    def _report_summary(self, report: SummaryReport) -> None:
+        if self._on_summary is not None:
+            self._on_summary(report)
 
     def _run_tool(self, call: ToolCall) -> ToolResult:
         """Run one tool call. Never raises: failures become error results.

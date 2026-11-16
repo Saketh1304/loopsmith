@@ -1,6 +1,6 @@
 from loopsmith.agent import Agent
-from loopsmith.context import TrimReport
-from loopsmith.llm import Message, ModelReply, ToolCall, ToolResult, Usage
+from loopsmith.context import SUMMARY_SYSTEM_PROMPT, SummaryReport, TrimReport
+from loopsmith.llm import Message, ModelError, ModelReply, ToolCall, ToolResult, Usage
 from loopsmith.llm.fake import FakeClient
 from loopsmith.tools import Tool, ToolError
 
@@ -328,3 +328,160 @@ def test_trim_observer_is_told_what_was_trimmed():
     assert isinstance(seen[0], TrimReport)
     assert seen[0].results_trimmed == 1
     assert seen[0].tokens_freed > 1_900
+
+
+# Summarising. These runs use a tool whose results are too small to trim
+# (under 1,000 characters), so trimming frees nothing and the agent has to
+# summarise. With a budget of 1,000 tokens, two old turns of 900
+# characters are enough to be worth a summary.
+
+
+def small_tool() -> Tool:
+    return make_tool("small", lambda args: "y" * 900)
+
+
+def small_call(input_tokens: int) -> ModelReply:
+    return ModelReply("", (ToolCall("small", {}),), usage=Usage(input_tokens, 10))
+
+
+def over_budget_script(summary_reply) -> list:
+    """Five tool turns; the fifth request reports a size over the budget."""
+    return [*[small_call(500)] * 4, small_call(5_000), summary_reply, "Done."]
+
+
+def test_old_history_is_summarised_when_trimming_is_not_enough():
+    client = FakeClient(over_budget_script(ModelReply("The bug is in median().")))
+
+    result = Agent(client, tools=[small_tool()], system="Be brief.", context_budget=1_000).run(
+        "Fix the bug"
+    )
+
+    # The sixth model call is the request for a summary: one plain message,
+    # its own instructions, and no tools.
+    request, system, tools = client.calls[5]
+    assert len(request) == 1
+    assert "Fix the bug" in request[0].text
+    assert "small result: " + "y" * 900 in request[0].text
+    assert system == SUMMARY_SYSTEM_PROMPT
+    assert tools is None
+
+    # The next real call sees the task with the summary, then only the
+    # three most recent tool turns.
+    history, system, _ = client.calls[6]
+    assert system == "Be brief."
+    assert history[0].text.startswith("Fix the bug\n\n[The earlier part")
+    assert history[0].text.endswith("The bug is in median().")
+    assert [message.role for message in history[1:]] == ["assistant", "tool"] * 3
+
+    # The summary call is not a step of the task.
+    assert result.text == "Done."
+    assert result.steps == 6
+
+
+def test_the_summary_call_is_counted_in_the_token_total():
+    summary = ModelReply("A summary.", usage=Usage(700, 40))
+    client = FakeClient(over_budget_script(summary))
+
+    result = Agent(client, tools=[small_tool()], context_budget=1_000).run("Fix the bug")
+
+    # Five tool steps (4 x 500 + 5,000 in, 10 out each) plus the summary.
+    assert result.usage == Usage(input_tokens=7_700, output_tokens=90)
+
+
+def test_summary_observer_is_told_how_much_was_replaced():
+    seen = []
+    summary = ModelReply("A summary.", usage=Usage(700, 40))
+    client = FakeClient(over_budget_script(summary))
+
+    Agent(client, tools=[small_tool()], context_budget=1_000, on_summary=seen.append).run("Go")
+
+    # Two old turns, each an assistant message and a tool message.
+    assert seen == [SummaryReport(messages_replaced=4, usage=Usage(700, 40))]
+
+
+class SummaryFailsClient(FakeClient):
+    """A FakeClient whose summary calls fail, as with a used-up quota."""
+
+    def generate(self, messages, system=None, tools=None):
+        if system == SUMMARY_SYSTEM_PROMPT:
+            self.calls.append((list(messages), system, tools))
+            raise ModelError("quota used up", status=429)
+        return super().generate(messages, system=system, tools=tools)
+
+
+def test_a_failed_summary_does_not_stop_the_run():
+    seen = []
+    client = SummaryFailsClient([*[small_call(500)] * 4, small_call(5_000), "Done."])
+
+    result = Agent(
+        client, tools=[small_tool()], context_budget=1_000, on_summary=seen.append
+    ).run("Fix the bug")
+
+    assert result.text == "Done."
+    assert result.finished is True
+    assert seen == [SummaryReport(error="quota used up")]
+    # The run went on with the whole history, nothing lost.
+    history = client.calls[-1][0]
+    assert history[0] == Message("user", "Fix the bug")
+    assert len([m for m in history if m.role == "tool"]) == 5
+
+
+def test_an_empty_summary_leaves_the_history_alone():
+    seen = []
+    client = FakeClient(over_budget_script(ModelReply("   ")))
+
+    Agent(client, tools=[small_tool()], context_budget=1_000, on_summary=seen.append).run("Go")
+
+    assert seen[0].error == "the model returned an empty summary"
+    assert len([m for m in client.calls[-1][0] if m.role == "tool"]) == 5
+
+
+def test_no_summary_when_trimming_alone_gets_under_the_budget():
+    # Results of 6,000 characters can be trimmed. Trimming the oldest one
+    # frees about 2,000 tokens, which brings 31,000 back under 30,000.
+    client = FakeClient(
+        [big_call(1_000), big_call(3_000), big_call(5_000), big_call(31_000), "Done."]
+    )
+    seen = []
+
+    Agent(client, tools=[big_tool()], context_budget=30_000, on_summary=seen.append).run("Go")
+
+    assert seen == []
+    assert len(client.calls) == 5  # no extra model call was made
+
+
+def test_no_summary_when_the_old_part_is_too_small_to_be_worth_a_call():
+    # Still far over the budget after trimming, but the old part is one
+    # trimmed note. A summary of it would save nothing.
+    client = FakeClient(
+        [big_call(1_000), big_call(3_000), big_call(5_000), big_call(50_000), "Done."]
+    )
+    seen = []
+
+    Agent(client, tools=[big_tool()], context_budget=30_000, on_summary=seen.append).run("Go")
+
+    assert seen == []
+    assert len(client.calls) == 5
+
+
+def test_a_second_summary_builds_on_the_first_and_keeps_the_task_once():
+    client = FakeClient(
+        [
+            *[small_call(500)] * 4,
+            small_call(5_000),
+            ModelReply("First summary."),
+            small_call(500),
+            small_call(5_000),
+            ModelReply("Second summary."),
+            "Done.",
+        ]
+    )
+
+    Agent(client, tools=[small_tool()], context_budget=1_000).run("Fix the bug")
+
+    second_request = client.calls[8][0][0].text
+    assert "Summary of the work before this record:\nFirst summary." in second_request
+    first_message = client.calls[-1][0][0].text
+    assert first_message.count("Fix the bug") == 1
+    assert "Second summary." in first_message
+    assert "First summary." not in first_message

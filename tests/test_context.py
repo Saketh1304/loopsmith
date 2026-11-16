@@ -1,10 +1,17 @@
 from loopsmith.context import (
     KEEP_RECENT_TOOL_TURNS,
     MIN_TRIM_CHARS,
+    SUMMARY_RESULT_CHARS,
     TrimReport,
+    estimate_history_tokens,
     estimate_tokens,
+    render_transcript,
+    split_history,
+    summary_request,
+    task_message,
     trim_history,
     trim_target,
+    worth_summarising,
 )
 from loopsmith.llm import Message, ToolCall, ToolResult
 
@@ -149,3 +156,113 @@ def test_an_already_trimmed_result_is_not_trimmed_again():
 
 def test_the_trim_target_is_half_the_budget():
     assert trim_target(30_000) == 15_000
+
+
+def test_split_keeps_the_recent_tool_turns_with_their_assistant_turns():
+    messages = history("a", "b", "c", "d", "e")
+
+    old, recent = split_history(messages)
+
+    # Five tool turns: the first two are old, the last three are kept.
+    assert result_texts(old) == ["a", "b"]
+    assert result_texts(recent) == ["c", "d", "e"]
+    # The kept part starts with the assistant turn that made the call, so
+    # no tool result is left without its call.
+    assert recent[0].role == "assistant"
+    assert recent[0].tool_calls[0].id == "call-3"
+    # Nothing is lost or repeated, and the task is in neither part.
+    assert [messages[0], *old, *recent] == messages
+
+
+def test_split_has_nothing_old_when_the_history_is_short():
+    messages = history(*["a"] * KEEP_RECENT_TOOL_TURNS)
+
+    old, recent = split_history(messages)
+
+    assert old == []
+    assert recent == messages[1:]
+
+
+def test_history_size_is_estimated_from_its_characters():
+    messages = [
+        Message("assistant", "x" * 30, (ToolCall("echo", {"text": "hi"}),)),
+        Message("tool", tool_results=(ToolResult("echo", "y" * 60),)),
+    ]
+    args_chars = len(str({"text": "hi"}))
+
+    assert estimate_history_tokens(messages) == (30 + args_chars + 60) // 3
+
+
+def test_an_assistant_turn_is_sized_by_its_raw_parts_when_it_has_them():
+    raw = [{"functionCall": {"name": "echo"}, "thoughtSignature": "s" * 300}]
+    message = Message("assistant", "", (ToolCall("echo", {}),), raw=raw)
+
+    assert estimate_history_tokens([message]) == len(str(raw)) // 3
+
+
+def test_summarising_needs_an_old_part_of_at_least_a_quarter_of_the_budget():
+    old = [Message("tool", tool_results=(ToolResult("echo", "y" * 3_000),))]  # 1,000 tokens
+
+    assert worth_summarising(old, budget=4_000) is True
+    assert worth_summarising(old, budget=4_004) is False
+    assert worth_summarising([], budget=4_000) is False
+
+
+def test_the_transcript_shows_text_tool_calls_results_and_errors():
+    messages = [
+        Message("assistant", "Let me look.", (ToolCall("read_file", {"path": "a.py"}),)),
+        Message(
+            "tool",
+            tool_results=(
+                ToolResult("read_file", "print(1)"),
+                ToolResult("run_command", "No such file", is_error=True),
+            ),
+        ),
+    ]
+
+    assert render_transcript(messages) == (
+        "assistant: Let me look.\n"
+        "assistant called read_file with {'path': 'a.py'}\n"
+        "read_file result: print(1)\n"
+        "run_command error: No such file"
+    )
+
+
+def test_long_results_are_cut_short_in_the_transcript():
+    long_text = "z" * (SUMMARY_RESULT_CHARS + 500)
+    messages = [Message("tool", tool_results=(ToolResult("read_file", long_text),))]
+
+    line = render_transcript(messages)
+
+    assert line.endswith("[... 500 more characters]")
+    assert line.count("z") == SUMMARY_RESULT_CHARS
+
+
+def test_the_summary_request_is_one_user_message_with_the_task_and_the_record():
+    old = history("found the bug")[1:]
+
+    request = summary_request("Fix the bug", "", old)
+
+    assert len(request) == 1
+    assert request[0].role == "user"
+    assert "The task the agent was given:\nFix the bug" in request[0].text
+    assert "read_file result: found the bug" in request[0].text
+    assert "Summary of the work before" not in request[0].text
+
+
+def test_the_summary_request_carries_an_earlier_summary_forward():
+    request = summary_request("Fix the bug", "Tests were failing.", history("x")[1:])
+
+    assert "Summary of the work before this record:\nTests were failing." in request[0].text
+
+
+def test_the_task_message_is_just_the_task_until_there_is_a_summary():
+    assert task_message("Fix the bug") == Message("user", "Fix the bug")
+
+
+def test_the_task_message_keeps_the_task_word_for_word_above_the_summary():
+    message = task_message("Fix the bug", "The bug is in median().")
+
+    assert message.role == "user"
+    assert message.text.startswith("Fix the bug\n\n[The earlier part of this work")
+    assert message.text.endswith("The bug is in median().")

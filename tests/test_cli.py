@@ -235,3 +235,32 @@ def test_context_budget_flag_can_turn_trimming_off(monkeypatch, tmp_path, capsys
     assert "trimmed" not in capsys.readouterr().err
     first_result = next(m for m in client.calls[-1][0] if m.role == "tool")
     assert first_result.tool_results[0].content == "x" * 6_000
+
+
+def read_small_file(input_tokens: int) -> ModelReply:
+    call = ToolCall("read_file", {"path": "small.txt"})
+    return ModelReply("", (call,), usage=Usage(input_tokens, 10))
+
+
+def test_summarising_is_reported_on_stderr(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "small.txt").write_text("y" * 900, encoding="utf-8")
+    client = FakeClient(
+        [
+            *[read_small_file(500)] * 4,
+            read_small_file(5_000),
+            ModelReply("The file is all y.", usage=Usage(700, 40)),
+            "Done.",
+        ]
+    )
+
+    exit_code = main(["read it five times", "--context-budget", "1000"], client=client)
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert captured.out.strip() == "Done."
+    assert (
+        "summarised 4 old messages (one extra model call: 700 tokens in, 40 out)"
+        in captured.err
+    )
+    assert "The file is all y." in client.calls[-1][0][0].text
