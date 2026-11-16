@@ -68,7 +68,7 @@ def test_uses_the_wait_the_server_asked_for():
 
 
 def test_observer_is_told_about_each_retry():
-    inner = FlakyClient([rate_limited(retry_after=1.0)])
+    inner = FlakyClient([rate_limited(retry_after=30.0)])
     seen = []
 
     RetryingClient(
@@ -77,7 +77,7 @@ def test_observer_is_told_about_each_retry():
         on_retry=lambda error, delay, attempt: seen.append((error.status, delay, attempt)),
     ).generate([Message("user", "hi")])
 
-    assert seen == [(429, 1.0, 1)]
+    assert seen == [(429, 30.0, 1)]
 
 
 def test_backoff_doubles_and_is_capped():
@@ -86,3 +86,14 @@ def test_backoff_doubles_and_is_capped():
     assert 8.0 <= backoff_delay(3) <= 12.0
     assert backoff_delay(20) == MAX_DELAY_SECONDS
     assert backoff_delay(1, retry_after=500.0) == MAX_DELAY_SECONDS
+
+
+def test_a_tiny_server_delay_does_not_shorten_the_backoff():
+    # Seen in a real run: Gemini answered 429 with a suggested wait of
+    # under a second, the retry went out at once and failed again.
+    assert 2.0 <= backoff_delay(1, retry_after=0.0) <= 3.0
+    assert 4.0 <= backoff_delay(2, retry_after=0.4) <= 6.0
+
+
+def test_a_longer_server_delay_wins_over_the_backoff():
+    assert backoff_delay(1, retry_after=34.0) == 34.0

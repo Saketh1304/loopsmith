@@ -56,11 +56,16 @@ class RetryingClient:
 def backoff_delay(attempt: int, retry_after: float | None = None) -> float:
     """How long to wait before the next attempt.
 
-    If the server said how long to wait, use that. Otherwise double the
-    wait each time (2s, 4s, 8s...) and add a random part, so that many
-    clients that failed together do not all retry at the same instant.
+    Double the wait each time (2s, 4s, 8s...) and add a random part, so
+    that many clients that failed together do not all retry at the same
+    instant. If the server said how long to wait, wait at least that long.
+
+    The server's figure is a minimum, never a shortcut. Gemini sometimes
+    suggests a wait of under a second, and retrying that quickly just
+    fails again and uses up one of the few attempts.
     """
-    if retry_after is not None:
-        return min(retry_after, MAX_DELAY_SECONDS)
     delay = BASE_DELAY_SECONDS * (2 ** (attempt - 1))
-    return min(delay + random.uniform(0, delay / 2), MAX_DELAY_SECONDS)
+    delay += random.uniform(0, delay / 2)
+    if retry_after is not None:
+        delay = max(delay, retry_after)
+    return min(delay, MAX_DELAY_SECONDS)
