@@ -13,6 +13,12 @@ what happens.
 from dataclasses import dataclass
 from typing import Callable
 
+from loopsmith.context import (
+    DEFAULT_CONTEXT_BUDGET,
+    TrimReport,
+    trim_history,
+    trim_target,
+)
 from loopsmith.llm.base import Message, ModelClient, ToolCall, ToolResult, Usage
 from loopsmith.tools.base import Tool, ToolError
 
@@ -33,6 +39,9 @@ Approver = Callable[[ToolCall, str], bool]
 # Called after each model call that reported token counts, with the step
 # number and the counts for that one call.
 UsageObserver = Callable[[int, Usage], None]
+
+# Called each time old tool output was trimmed from the history.
+TrimObserver = Callable[[TrimReport], None]
 
 
 @dataclass(frozen=True)
@@ -55,6 +64,8 @@ class Agent:
         on_tool: ToolObserver | None = None,
         approve: Approver | None = None,
         on_usage: UsageObserver | None = None,
+        context_budget: int | None = DEFAULT_CONTEXT_BUDGET,
+        on_trim: TrimObserver | None = None,
     ):
         self._client = client
         self._tools = {tool.name: tool for tool in tools}
@@ -63,6 +74,8 @@ class Agent:
         self._on_tool = on_tool
         self._approve = approve
         self._on_usage = on_usage
+        self._context_budget = context_budget  # None or 0 turns trimming off
+        self._on_trim = on_trim
 
     def run(self, task: str) -> AgentResult:
         messages = [Message("user", task)]
@@ -95,6 +108,12 @@ class Agent:
             results = tuple(self._run_tool(call) for call in reply.tool_calls)
             messages.append(Message("tool", tool_results=results))
 
+            # Trim only on a fresh measurement. With no token count from
+            # the provider the history size is unknown, and it is left
+            # alone.
+            if reply.usage is not None:
+                messages = self._trim_if_over_budget(messages, reply.usage.input_tokens)
+
         return AgentResult(
             text=f"Stopped after {self._max_steps} steps without finishing.",
             steps=self._max_steps,
@@ -102,6 +121,16 @@ class Agent:
             usage=total,
             context_tokens=context_tokens,
         )
+
+    def _trim_if_over_budget(self, messages: list[Message], tokens: int) -> list[Message]:
+        """Trim old tool output once the last request passed the budget."""
+        budget = self._context_budget
+        if not budget or tokens <= budget:
+            return messages
+        trimmed, report = trim_history(messages, tokens - trim_target(budget))
+        if report.results_trimmed and self._on_trim is not None:
+            self._on_trim(report)
+        return trimmed
 
     def _run_tool(self, call: ToolCall) -> ToolResult:
         """Run one tool call. Never raises: failures become error results.

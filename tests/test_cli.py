@@ -201,3 +201,37 @@ def test_no_usage_line_when_the_model_reports_no_counts(monkeypatch, tmp_path, c
     main(["say hello"], client=FakeClient(["Hello."]))
 
     assert "tokens" not in capsys.readouterr().err
+
+
+def read_big_file(input_tokens: int) -> ModelReply:
+    call = ToolCall("read_file", {"path": "big.txt"})
+    return ModelReply("", (call,), usage=Usage(input_tokens, 10))
+
+
+def test_trimming_is_reported_on_stderr(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "big.txt").write_text("x" * 6_000, encoding="utf-8")
+    replies = [read_big_file(n) for n in (1_000, 3_000, 5_000, 50_000)]
+    client = FakeClient([*replies, "Done."])
+
+    exit_code = main(["read it four times"], client=client)
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert captured.out.strip() == "Done."
+    assert "trimmed 1 old tool result, about" in captured.err
+    first_result = next(m for m in client.calls[-1][0] if m.role == "tool")
+    assert first_result.tool_results[0].content.startswith("[Old output removed")
+
+
+def test_context_budget_flag_can_turn_trimming_off(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "big.txt").write_text("x" * 6_000, encoding="utf-8")
+    replies = [read_big_file(n) for n in (1_000, 3_000, 5_000, 50_000)]
+    client = FakeClient([*replies, "Done."])
+
+    main(["read it four times", "--context-budget", "0"], client=client)
+
+    assert "trimmed" not in capsys.readouterr().err
+    first_result = next(m for m in client.calls[-1][0] if m.role == "tool")
+    assert first_result.tool_results[0].content == "x" * 6_000

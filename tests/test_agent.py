@@ -1,4 +1,5 @@
 from loopsmith.agent import Agent
+from loopsmith.context import TrimReport
 from loopsmith.llm import Message, ModelReply, ToolCall, ToolResult, Usage
 from loopsmith.llm.fake import FakeClient
 from loopsmith.tools import Tool, ToolError
@@ -254,3 +255,76 @@ def test_usage_observer_sees_each_step_that_reported_counts():
     ).run("Say a then b")
 
     assert seen == [(1, Usage(100, 10)), (3, Usage(300, 5))]
+
+
+def big_tool() -> Tool:
+    return make_tool("big", lambda args: "x" * 6_000)
+
+
+def big_call(input_tokens: int | None) -> ModelReply:
+    """A reply asking for the big tool, reporting the given request size."""
+    usage = None if input_tokens is None else Usage(input_tokens, 10)
+    return ModelReply("", (ToolCall("big", {}),), usage=usage)
+
+
+def first_result_seen_by_last_call(client: FakeClient) -> str:
+    history = client.calls[-1][0]
+    return next(m for m in history if m.role == "tool").tool_results[0].content
+
+
+def test_old_tool_output_is_trimmed_once_the_budget_is_passed():
+    # Four tool turns. The fourth request reports 50,000 tokens, over the
+    # budget, so the oldest result (outside the three protected turns) is
+    # replaced before the fifth request.
+    client = FakeClient(
+        [big_call(1_000), big_call(3_000), big_call(5_000), big_call(50_000), "Done."]
+    )
+
+    Agent(client, tools=[big_tool()], context_budget=30_000).run("Go")
+
+    history = client.calls[-1][0]
+    texts = [m.tool_results[0].content for m in history if m.role == "tool"]
+    assert texts[0].startswith("[Old output removed to save space: 6,000 characters")
+    assert texts[1:] == ["x" * 6_000] * 3
+
+
+def test_history_under_the_budget_is_left_alone():
+    client = FakeClient(
+        [big_call(1_000), big_call(3_000), big_call(5_000), big_call(7_000), "Done."]
+    )
+
+    Agent(client, tools=[big_tool()], context_budget=30_000).run("Go")
+
+    assert first_result_seen_by_last_call(client) == "x" * 6_000
+
+
+def test_history_is_not_trimmed_when_the_model_reports_no_usage():
+    client = FakeClient([big_call(None)] * 4 + ["Done."])
+
+    Agent(client, tools=[big_tool()], context_budget=1).run("Go")
+
+    assert first_result_seen_by_last_call(client) == "x" * 6_000
+
+
+def test_a_budget_of_zero_turns_trimming_off():
+    client = FakeClient(
+        [big_call(1_000), big_call(3_000), big_call(5_000), big_call(50_000), "Done."]
+    )
+
+    Agent(client, tools=[big_tool()], context_budget=0).run("Go")
+
+    assert first_result_seen_by_last_call(client) == "x" * 6_000
+
+
+def test_trim_observer_is_told_what_was_trimmed():
+    seen = []
+    client = FakeClient(
+        [big_call(1_000), big_call(3_000), big_call(5_000), big_call(50_000), "Done."]
+    )
+
+    Agent(client, tools=[big_tool()], context_budget=30_000, on_trim=seen.append).run("Go")
+
+    assert len(seen) == 1
+    assert isinstance(seen[0], TrimReport)
+    assert seen[0].results_trimmed == 1
+    assert seen[0].tokens_freed > 1_900

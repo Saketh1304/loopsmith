@@ -14,6 +14,7 @@ from pathlib import Path
 from loopsmith import __version__
 from loopsmith.agent import DEFAULT_MAX_STEPS, Agent, AgentResult, Approver
 from loopsmith.config import ConfigError, get_api_key, get_model_name, load_env_file
+from loopsmith.context import DEFAULT_CONTEXT_BUDGET, TrimReport
 from loopsmith.llm import ModelClient, ModelError, ToolCall, ToolResult, Usage
 from loopsmith.llm.gemini import GeminiClient
 from loopsmith.llm.retry import RetryingClient
@@ -56,6 +57,13 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"stop after this many model calls (default {DEFAULT_MAX_STEPS})",
     )
     parser.add_argument(
+        "--context-budget",
+        type=int,
+        default=DEFAULT_CONTEXT_BUDGET,
+        help="trim old tool output once a request passes this many tokens "
+        f"(default {DEFAULT_CONTEXT_BUDGET}; 0 turns trimming off)",
+    )
+    parser.add_argument(
         "-y",
         "--yes",
         action="store_true",
@@ -94,6 +102,15 @@ def print_step_usage(step: int, usage: Usage) -> None:
     print(
         f"  .. step {step}: {usage.input_tokens:,} tokens in, "
         f"{usage.output_tokens:,} out",
+        file=sys.stderr,
+    )
+
+
+def print_trim(report: TrimReport) -> None:
+    noun = "result" if report.results_trimmed == 1 else "results"
+    print(
+        f"  .. trimmed {report.results_trimmed} old tool {noun}, "
+        f"about {report.tokens_freed:,} tokens",
         file=sys.stderr,
     )
 
@@ -167,6 +184,8 @@ def main(
             on_tool=print_tool_call,
             approve=approve,
             on_usage=print_step_usage,
+            context_budget=args.context_budget,
+            on_trim=print_trim,
         )
         result = agent.run(args.task)
         print_total_usage(result)
