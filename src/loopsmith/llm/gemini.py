@@ -8,6 +8,7 @@ API references:
 from urllib.parse import quote
 
 from loopsmith.llm.base import (
+    LONG_WAIT_SECONDS,
     Message,
     ModelError,
     ModelReply,
@@ -59,6 +60,7 @@ class GeminiClient:
 
     def _error(self, status: int, body: dict) -> ModelError:
         detail = body.get("error", {}).get("message", "no details given")
+        delay = _retry_delay(body)
         if status == 404:
             hint = (
                 f"Model '{self._model}' was not found. Run "
@@ -66,7 +68,7 @@ class GeminiClient:
                 "then set GEMINI_MODEL in your .env file."
             )
         elif status == 429:
-            hint = "Rate limit reached. Wait a minute and try again."
+            hint = self._rate_limit_hint(delay)
         elif status in (401, 403):
             hint = "The request was rejected. Check that your API key is correct."
         elif status == 400:
@@ -76,9 +78,29 @@ class GeminiClient:
         else:
             hint = "The request failed."
         retryable = status == 429 or status >= 500
-        return ModelError(
-            f"{hint} (HTTP {status}: {detail})", status, retryable, _retry_delay(body)
-        )
+        return ModelError(f"{hint} (HTTP {status}: {detail})", status, retryable, delay)
+
+    def _rate_limit_hint(self, delay: float | None) -> str:
+        if delay is None:
+            return "Rate limit reached. Wait a minute and try again."
+        if delay > LONG_WAIT_SECONDS:
+            return (
+                f"The request quota for model '{self._model}' is used up. It "
+                f"resets in about {format_wait(delay)}. Wait until then, or set "
+                "GEMINI_MODEL in your .env file to another model "
+                "(`loopsmith --list-models` shows the choices)."
+            )
+        return f"Rate limit reached. Try again in about {format_wait(delay)}."
+
+
+def format_wait(seconds: float) -> str:
+    """Turn a number of seconds into words, such as "18 h 1 min"."""
+    minutes = int(seconds // 60)
+    if minutes >= 60:
+        return f"{minutes // 60} h {minutes % 60} min"
+    if minutes >= 1:
+        return f"{minutes} min"
+    return f"{int(seconds)} s"
 
 
 def _retry_delay(body: dict) -> float | None:

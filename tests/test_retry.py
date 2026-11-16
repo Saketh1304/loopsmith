@@ -97,3 +97,25 @@ def test_a_tiny_server_delay_does_not_shorten_the_backoff():
 
 def test_a_longer_server_delay_wins_over_the_backoff():
     assert backoff_delay(1, retry_after=34.0) == 34.0
+
+
+def test_a_very_long_server_wait_is_not_retried():
+    # "Retry in 18 hours" is a used-up daily quota. Waiting a minute and
+    # trying again cannot work, so the error is raised at once.
+    inner = FlakyClient([rate_limited(retry_after=64_903.0)])
+    waits = []
+
+    with pytest.raises(ModelError):
+        RetryingClient(inner, sleep=waits.append).generate([Message("user", "hi")])
+
+    assert inner.attempts == 1
+    assert waits == []
+
+
+def test_a_wait_of_a_few_minutes_is_still_retried():
+    inner = FlakyClient([rate_limited(retry_after=120.0)])
+    waits = []
+
+    RetryingClient(inner, sleep=waits.append).generate([Message("user", "hi")])
+
+    assert waits == [MAX_DELAY_SECONDS]

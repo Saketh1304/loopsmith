@@ -117,6 +117,11 @@ class ModelReply:
         return Message("assistant", self.text, self.tool_calls)
 
 
+# A server that asks for a wait longer than this is reporting a used-up
+# quota, not a short burst of traffic. Retrying will not help.
+LONG_WAIT_SECONDS = 300.0
+
+
 class ModelError(Exception):
     """A call to the model failed.
 

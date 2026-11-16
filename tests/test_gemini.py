@@ -1,7 +1,7 @@
 import pytest
 
 from loopsmith.llm import Message, ModelError, ToolCall, ToolResult, ToolSpec, Usage
-from loopsmith.llm.gemini import GeminiClient, build_request_body, parse_reply
+from loopsmith.llm.gemini import GeminiClient, build_request_body, format_wait, parse_reply
 
 
 class RecordingTransport:
@@ -303,3 +303,46 @@ def test_missing_token_counts_are_zero():
 
 def test_reply_without_usage_metadata_has_no_usage():
     assert parse_reply(reply_body("hi")).usage is None
+
+
+def quota_error_body(retry_delay: str) -> dict:
+    return {
+        "error": {
+            "message": "You exceeded your current quota",
+            "details": [
+                {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": retry_delay}
+            ],
+        }
+    }
+
+
+def test_a_used_up_daily_quota_is_explained_as_one():
+    # Seen in a real run: the free tier's 20 requests a day ran out and
+    # the server said to retry in 18 hours.
+    transport = RecordingTransport(429, quota_error_body("64903.7s"))
+    client = GeminiClient("key", "some-model", transport)
+
+    with pytest.raises(ModelError) as error_info:
+        client.generate([Message("user", "hello")])
+
+    message = str(error_info.value)
+    assert "quota for model 'some-model' is used up" in message
+    assert "18 h 1 min" in message
+    assert "GEMINI_MODEL" in message
+    assert "Wait a minute" not in message
+    assert error_info.value.retry_after == 64903.7
+
+
+def test_a_short_rate_limit_says_how_long_to_wait():
+    client = GeminiClient("key", "m", RecordingTransport(429, quota_error_body("34s")))
+
+    with pytest.raises(ModelError, match="Rate limit reached. Try again in about 34 s"):
+        client.generate([Message("user", "hello")])
+
+
+@pytest.mark.parametrize(
+    ("seconds", "expected"),
+    [(0.4, "0 s"), (34, "34 s"), (60, "1 min"), (150, "2 min"), (3600, "1 h 0 min"), (64903.7, "18 h 1 min")],
+)
+def test_waits_are_written_in_words(seconds, expected):
+    assert format_wait(seconds) == expected

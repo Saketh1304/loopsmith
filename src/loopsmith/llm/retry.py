@@ -8,7 +8,14 @@ import random
 import time
 from typing import Callable
 
-from loopsmith.llm.base import Message, ModelClient, ModelError, ModelReply, ToolSpec
+from loopsmith.llm.base import (
+    LONG_WAIT_SECONDS,
+    Message,
+    ModelClient,
+    ModelError,
+    ModelReply,
+    ToolSpec,
+)
 
 MAX_ATTEMPTS = 4
 BASE_DELAY_SECONDS = 2.0
@@ -45,6 +52,11 @@ class RetryingClient:
                 # A bad key or an unknown model fails the same way every
                 # time, so only errors marked retryable are tried again.
                 if not error.retryable or attempt >= self._max_attempts:
+                    raise
+                # "Retry in 18 hours" means a daily quota is used up. The
+                # waits here are capped at a minute, so every retry would
+                # fail the same way. Stop now and report it.
+                if error.retry_after is not None and error.retry_after > LONG_WAIT_SECONDS:
                     raise
                 delay = backoff_delay(attempt, error.retry_after)
                 if self._on_retry is not None:
