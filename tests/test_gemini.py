@@ -1,6 +1,6 @@
 import pytest
 
-from loopsmith.llm import Message, ModelError, ToolCall, ToolResult, ToolSpec
+from loopsmith.llm import Message, ModelError, ToolCall, ToolResult, ToolSpec, Usage
 from loopsmith.llm.gemini import GeminiClient, build_request_body, parse_reply
 
 
@@ -267,3 +267,39 @@ def test_error_without_retry_info_has_no_retry_delay():
         client.generate([Message("user", "hello")])
 
     assert error_info.value.retry_after is None
+
+
+def test_token_counts_are_read_from_the_reply():
+    body = reply_body("hi")
+    body["usageMetadata"] = {
+        "promptTokenCount": 1200,
+        "candidatesTokenCount": 30,
+        "cachedContentTokenCount": 1000,
+        "totalTokenCount": 1230,
+    }
+
+    assert parse_reply(body).usage == Usage(
+        input_tokens=1200, output_tokens=30, cached_tokens=1000
+    )
+
+
+def test_thinking_tokens_count_as_output():
+    body = reply_body("hi")
+    body["usageMetadata"] = {
+        "promptTokenCount": 50,
+        "candidatesTokenCount": 10,
+        "thoughtsTokenCount": 200,
+    }
+
+    assert parse_reply(body).usage == Usage(input_tokens=50, output_tokens=210)
+
+
+def test_missing_token_counts_are_zero():
+    body = reply_body("hi")
+    body["usageMetadata"] = {"promptTokenCount": 50}
+
+    assert parse_reply(body).usage == Usage(input_tokens=50)
+
+
+def test_reply_without_usage_metadata_has_no_usage():
+    assert parse_reply(reply_body("hi")).usage is None

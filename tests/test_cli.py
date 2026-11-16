@@ -4,7 +4,7 @@ import pytest
 
 from loopsmith.cli import ask_on_terminal, main, system_prompt
 from loopsmith.config import API_KEY_VAR
-from loopsmith.llm import Message, ModelError, ToolCall
+from loopsmith.llm import Message, ModelError, ModelReply, ToolCall, Usage
 from loopsmith.llm.fake import FakeClient
 
 
@@ -174,3 +174,30 @@ def test_ask_on_terminal_accepts_yes_in_any_case(monkeypatch, capsys):
     monkeypatch.setattr("sys.stdin", FakeTerminal("YES\n"))
 
     assert ask_on_terminal(WRITE_CALL, "Create file new.txt") is True
+
+
+def test_token_usage_goes_to_stderr_not_stdout(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    client = FakeClient(
+        [
+            ModelReply("", (ToolCall("list_files", {}),), usage=Usage(1500, 20)),
+            ModelReply("All done.", usage=Usage(1800, 40, cached_tokens=1200)),
+        ]
+    )
+
+    exit_code = main(["look around"], client=client)
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert captured.out.strip() == "All done."
+    assert "step 1: 1,500 tokens in, 20 out" in captured.err
+    assert "step 2: 1,800 tokens in, 40 out" in captured.err
+    assert "tokens: 3,300 in (1,200 cached), 60 out; last request 1,800" in captured.err
+
+
+def test_no_usage_line_when_the_model_reports_no_counts(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+
+    main(["say hello"], client=FakeClient(["Hello."]))
+
+    assert "tokens" not in capsys.readouterr().err

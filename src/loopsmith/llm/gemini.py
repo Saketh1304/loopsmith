@@ -13,6 +13,7 @@ from loopsmith.llm.base import (
     ModelReply,
     ToolCall,
     ToolSpec,
+    Usage,
 )
 from loopsmith.llm.http import Transport, send_json
 
@@ -179,4 +180,30 @@ def parse_reply(body: dict) -> ModelReply:
         if "functionCall" in part
     )
     message = Message("assistant", text, tool_calls, raw=parts)
-    return ModelReply(text=text, tool_calls=tool_calls, message=message)
+    return ModelReply(
+        text=text, tool_calls=tool_calls, message=message, usage=parse_usage(body)
+    )
+
+
+def parse_usage(body: dict) -> Usage | None:
+    """Read the token counts Gemini attaches to every reply.
+
+    Gemini reports thinking tokens separately from the answer. Both are
+    output the model produced and both are billed as output, so they are
+    added together here.
+    """
+    metadata = body.get("usageMetadata")
+    if not isinstance(metadata, dict):
+        return None
+    return Usage(
+        input_tokens=_count(metadata, "promptTokenCount"),
+        output_tokens=_count(metadata, "candidatesTokenCount")
+        + _count(metadata, "thoughtsTokenCount"),
+        cached_tokens=_count(metadata, "cachedContentTokenCount"),
+    )
+
+
+def _count(metadata: dict, key: str) -> int:
+    """A missing count means zero: Gemini leaves out fields that are 0."""
+    value = metadata.get(key)
+    return value if isinstance(value, int) else 0

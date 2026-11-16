@@ -66,15 +66,50 @@ class Message:
 
 
 @dataclass(frozen=True)
+class Usage:
+    """Token counts for one model call, as the provider reported them.
+
+    A token is the unit a model counts text in: roughly four characters
+    of English. Providers limit and bill by tokens, not characters.
+
+    - `input_tokens`: everything we sent. That is the system prompt, the
+      tool descriptions and the whole history, so on the latest call it
+      is the size of the conversation so far.
+    - `output_tokens`: what the model produced, including its thinking.
+    - `cached_tokens`: the part of `input_tokens` the provider had seen
+      before and read from its cache, which is billed at a lower rate.
+    """
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cached_tokens: int = 0
+
+    def __add__(self, other: "Usage") -> "Usage":
+        """Lets two usages be added with `+`.
+
+        Java has no operator overloading; there this would be a
+        `plus(Usage other)` method. It returns a new object because the
+        class is frozen, like an immutable Java record.
+        """
+        return Usage(
+            self.input_tokens + other.input_tokens,
+            self.output_tokens + other.output_tokens,
+            self.cached_tokens + other.cached_tokens,
+        )
+
+
+@dataclass(frozen=True)
 class ModelReply:
     """What the model answered.
 
-    `message` is the assistant turn to append to the history.
+    `message` is the assistant turn to append to the history. `usage` is
+    None when the provider did not report token counts.
     """
 
     text: str
     tool_calls: tuple[ToolCall, ...] = ()
     message: Message | None = None
+    usage: Usage | None = None
 
     def as_message(self) -> Message:
         if self.message is not None:

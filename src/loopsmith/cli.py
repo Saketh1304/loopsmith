@@ -12,9 +12,9 @@ import sys
 from pathlib import Path
 
 from loopsmith import __version__
-from loopsmith.agent import DEFAULT_MAX_STEPS, Agent, Approver
+from loopsmith.agent import DEFAULT_MAX_STEPS, Agent, AgentResult, Approver
 from loopsmith.config import ConfigError, get_api_key, get_model_name, load_env_file
-from loopsmith.llm import ModelClient, ModelError, ToolCall, ToolResult
+from loopsmith.llm import ModelClient, ModelError, ToolCall, ToolResult, Usage
 from loopsmith.llm.gemini import GeminiClient
 from loopsmith.llm.retry import RetryingClient
 from loopsmith.tools import Workspace, default_tools
@@ -89,6 +89,27 @@ def print_retry(error: ModelError, delay: float, attempt: int) -> None:
     )
 
 
+def print_step_usage(step: int, usage: Usage) -> None:
+    """Show how big each request was, so the history can be seen growing."""
+    print(
+        f"  .. step {step}: {usage.input_tokens:,} tokens in, "
+        f"{usage.output_tokens:,} out",
+        file=sys.stderr,
+    )
+
+
+def print_total_usage(result: AgentResult) -> None:
+    """Show the token totals for the run. Silent if none were reported."""
+    usage = result.usage
+    if usage == Usage():
+        return
+    print(
+        f"  tokens: {usage.input_tokens:,} in ({usage.cached_tokens:,} cached), "
+        f"{usage.output_tokens:,} out; last request {result.context_tokens:,}",
+        file=sys.stderr,
+    )
+
+
 def approve_everything(call: ToolCall, preview: str) -> bool:
     return True
 
@@ -145,8 +166,10 @@ def main(
             max_steps=args.max_steps,
             on_tool=print_tool_call,
             approve=approve,
+            on_usage=print_step_usage,
         )
         result = agent.run(args.task)
+        print_total_usage(result)
         print(result.text)
         return 0 if result.finished else 1
     except (ConfigError, ModelError) as error:

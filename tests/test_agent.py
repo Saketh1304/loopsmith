@@ -1,5 +1,5 @@
 from loopsmith.agent import Agent
-from loopsmith.llm import Message, ToolCall, ToolResult
+from loopsmith.llm import Message, ModelReply, ToolCall, ToolResult, Usage
 from loopsmith.llm.fake import FakeClient
 from loopsmith.tools import Tool, ToolError
 
@@ -198,3 +198,59 @@ def test_read_only_tools_never_ask_for_approval():
     ).run("Say hi")
 
     assert asked == []
+
+
+def test_usages_add_field_by_field():
+    assert Usage(10, 2, 4) + Usage(30, 5, 20) == Usage(40, 7, 24)
+
+
+def test_token_usage_is_totalled_across_the_run():
+    client = FakeClient(
+        [
+            ModelReply("", (ToolCall("echo", {"text": "hi"}),), usage=Usage(100, 10)),
+            ModelReply("Done.", usage=Usage(150, 5, cached_tokens=90)),
+        ]
+    )
+
+    result = Agent(client, tools=[echo_tool()]).run("Say hi")
+
+    assert result.usage == Usage(input_tokens=250, output_tokens=15, cached_tokens=90)
+    # The history size is what the last call sent, not the running total.
+    assert result.context_tokens == 150
+
+
+def test_usage_is_still_reported_when_the_step_limit_stops_the_run():
+    replies = [
+        ModelReply("", (ToolCall("echo", {"text": "x"}),), usage=Usage(100, 10))
+        for _ in range(3)
+    ]
+
+    result = Agent(FakeClient(replies), tools=[echo_tool()], max_steps=2).run("Loop")
+
+    assert result.finished is False
+    assert result.usage == Usage(input_tokens=200, output_tokens=20)
+    assert result.context_tokens == 100
+
+
+def test_a_model_that_reports_no_usage_gives_zero_totals():
+    result = Agent(FakeClient(["Hello."]), tools=[]).run("Say hello")
+
+    assert result.usage == Usage()
+    assert result.context_tokens == 0
+
+
+def test_usage_observer_sees_each_step_that_reported_counts():
+    seen = []
+    client = FakeClient(
+        [
+            ModelReply("", (ToolCall("echo", {"text": "a"}),), usage=Usage(100, 10)),
+            ToolCall("echo", {"text": "b"}),  # this reply reports no usage
+            ModelReply("Done.", usage=Usage(300, 5)),
+        ]
+    )
+
+    Agent(
+        client, tools=[echo_tool()], on_usage=lambda step, usage: seen.append((step, usage))
+    ).run("Say a then b")
+
+    assert seen == [(1, Usage(100, 10)), (3, Usage(300, 5))]

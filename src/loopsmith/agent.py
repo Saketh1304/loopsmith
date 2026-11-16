@@ -13,7 +13,7 @@ what happens.
 from dataclasses import dataclass
 from typing import Callable
 
-from loopsmith.llm.base import Message, ModelClient, ToolCall, ToolResult
+from loopsmith.llm.base import Message, ModelClient, ToolCall, ToolResult, Usage
 from loopsmith.tools.base import Tool, ToolError
 
 DEFAULT_MAX_STEPS = 20
@@ -30,12 +30,19 @@ ToolObserver = Callable[[ToolCall, ToolResult], None]
 # description of what it will do; returns True to allow it.
 Approver = Callable[[ToolCall, str], bool]
 
+# Called after each model call that reported token counts, with the step
+# number and the counts for that one call.
+UsageObserver = Callable[[int, Usage], None]
+
 
 @dataclass(frozen=True)
 class AgentResult:
     text: str
     steps: int
     finished: bool  # False when the step limit stopped the run
+    usage: Usage = Usage()  # total over every model call in the run
+    # Input tokens of the last model call: how big the history had grown.
+    context_tokens: int = 0
 
 
 class Agent:
@@ -47,6 +54,7 @@ class Agent:
         max_steps: int = DEFAULT_MAX_STEPS,
         on_tool: ToolObserver | None = None,
         approve: Approver | None = None,
+        on_usage: UsageObserver | None = None,
     ):
         self._client = client
         self._tools = {tool.name: tool for tool in tools}
@@ -54,17 +62,35 @@ class Agent:
         self._max_steps = max_steps
         self._on_tool = on_tool
         self._approve = approve
+        self._on_usage = on_usage
 
     def run(self, task: str) -> AgentResult:
         messages = [Message("user", task)]
         specs = [tool.spec for tool in self._tools.values()]
+        total = Usage()
+        context_tokens = 0
 
         for step in range(1, self._max_steps + 1):
             reply = self._client.generate(messages, system=self._system, tools=specs)
             messages.append(reply.as_message())
 
+            # Every call sends the whole history again, so the total grows
+            # faster than the history does. The latest call's input count
+            # is the size of the history itself.
+            if reply.usage is not None:
+                total = total + reply.usage
+                context_tokens = reply.usage.input_tokens
+                if self._on_usage is not None:
+                    self._on_usage(step, reply.usage)
+
             if not reply.tool_calls:
-                return AgentResult(text=reply.text, steps=step, finished=True)
+                return AgentResult(
+                    text=reply.text,
+                    steps=step,
+                    finished=True,
+                    usage=total,
+                    context_tokens=context_tokens,
+                )
 
             results = tuple(self._run_tool(call) for call in reply.tool_calls)
             messages.append(Message("tool", tool_results=results))
@@ -73,6 +99,8 @@ class Agent:
             text=f"Stopped after {self._max_steps} steps without finishing.",
             steps=self._max_steps,
             finished=False,
+            usage=total,
+            context_tokens=context_tokens,
         )
 
     def _run_tool(self, call: ToolCall) -> ToolResult:
