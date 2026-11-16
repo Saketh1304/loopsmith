@@ -143,10 +143,4 @@ src/loopsmith/
   tools/         the actions the agent can take
 tests/           automated tests
 examples/        a small buggy project to try the agent on
-docs/            design decisions and interview notes
 ```
-
-## Design notes
-
-The reasoning behind each design choice is in
-[docs/decisions.md](docs/decisions.md).
