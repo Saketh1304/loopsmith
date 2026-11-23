@@ -10,7 +10,7 @@ from loopsmith.tools.files import (
 )
 from loopsmith.tools.shell import run_command_tool
 
-__all__ = ["Tool", "ToolError", "Workspace", "default_tools"]
+__all__ = ["Tool", "ToolError", "Workspace", "default_tools", "research_tools"]
 
 
 def default_tools(workspace: Workspace) -> list[Tool]:
@@ -21,3 +21,8 @@ def default_tools(workspace: Workspace) -> list[Tool]:
         write_file_tool(workspace),
         run_command_tool(workspace),
     ]
+
+
+def research_tools(workspace: Workspace) -> list[Tool]:
+    """The tools that only look and never change anything."""
+    return [list_files_tool(workspace), read_file_tool(workspace)]

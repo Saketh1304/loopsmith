@@ -35,6 +35,7 @@ def test_sends_task_to_model_and_prints_reply(monkeypatch, tmp_path, capsys):
         "edit_file",
         "write_file",
         "run_command",
+        "delegate",
     }
 
 
@@ -264,3 +265,40 @@ def test_summarising_is_reported_on_stderr(monkeypatch, tmp_path, capsys):
         in captured.err
     )
     assert "The file is all y." in client.calls[-1][0][0].text
+
+
+def test_a_sub_agent_run_is_shown_indented_and_counted_in_the_total(
+    monkeypatch, tmp_path, capsys
+):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "notes.txt").write_text("the secret word is mango", encoding="utf-8")
+    ask = ToolCall("delegate", {"task": "What is the secret word in notes.txt?"})
+    client = FakeClient(
+        [
+            ModelReply("", (ask,), usage=Usage(1_000, 10)),
+            ModelReply("", (ToolCall("read_file", {"path": "notes.txt"}),), usage=Usage(400, 5)),
+            ModelReply("The word is mango.", usage=Usage(900, 20)),
+            ModelReply("It is mango.", usage=Usage(1_100, 15)),
+        ]
+    )
+
+    exit_code = main(["find the secret word"], client=client)
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert captured.out.strip() == "It is mango."
+    # The sub-agent's work is indented further than the main agent's.
+    assert "      .. sub-agent step 1: 400 tokens in, 5 out" in captured.err
+    assert "      -> read_file(path='notes.txt')" in captured.err
+    assert "  -> delegate(task='What is the secret word in notes.txt?')" in captured.err
+    assert (
+        "tokens: 3,400 in (0 cached), 50 out; last request 1,100; "
+        "1 sub-agent run used 1,300 of the tokens in"
+    ) in captured.err
+    # The main agent saw the answer, not the file.
+    result = next(m for m in client.calls[-1][0] if m.role == "tool").tool_results[0]
+    assert result.content == "The word is mango."
+
+
+def test_the_system_prompt_tells_the_model_about_delegate():
+    assert "delegate" in system_prompt()

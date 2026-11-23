@@ -18,7 +18,8 @@ from loopsmith.context import DEFAULT_CONTEXT_BUDGET, SummaryReport, TrimReport
 from loopsmith.llm import ModelClient, ModelError, ToolCall, ToolResult, Usage
 from loopsmith.llm.gemini import GeminiClient
 from loopsmith.llm.retry import RetryingClient
-from loopsmith.tools import Workspace, default_tools
+from loopsmith.subagent import SubAgents
+from loopsmith.tools import Workspace, default_tools, research_tools
 
 
 def system_prompt() -> str:
@@ -31,6 +32,10 @@ def system_prompt() -> str:
         "- Read a file before editing it. Use edit_file for small changes and "
         "write_file for new files.\n"
         "- After changing code, run the project's tests if it has any.\n"
+        "- For a question that needs reading several files, use delegate. A "
+        "sub-agent does the reading and gives you only its findings, which "
+        "keeps this conversation short. Read a file yourself when you are "
+        "about to edit it.\n"
         f"- Commands run on {platform.system()} through the system shell. They "
         "cannot ask for keyboard input and are stopped after a time limit.\n"
         "- The user approves each change and command. If one is declined, do "
@@ -79,14 +84,31 @@ def build_parser() -> argparse.ArgumentParser:
 # answer, which keeps the output usable in scripts.
 
 
-def print_tool_call(call: ToolCall, result: ToolResult) -> None:
+def print_tool_call(call: ToolCall, result: ToolResult, indent: str = "  ") -> None:
     """Show each tool call after it has run."""
     shown = []
     for key, value in call.args.items():
         text = repr(value)
         shown.append(f"{key}={text if len(text) <= 60 else text[:57] + '...'}")
     status = "error" if result.is_error else f"{len(result.content)} chars"
-    print(f"  -> {call.name}({', '.join(shown)})  [{status}]", file=sys.stderr)
+    print(f"{indent}-> {call.name}({', '.join(shown)})  [{status}]", file=sys.stderr)
+
+
+# A sub-agent's activity is shown further in, above the `delegate` call
+# that started it.
+SUB_INDENT = "      "
+
+
+def print_sub_tool_call(call: ToolCall, result: ToolResult) -> None:
+    print_tool_call(call, result, indent=SUB_INDENT)
+
+
+def print_sub_step_usage(step: int, usage: Usage) -> None:
+    print(
+        f"{SUB_INDENT}.. sub-agent step {step}: {usage.input_tokens:,} tokens in, "
+        f"{usage.output_tokens:,} out",
+        file=sys.stderr,
+    )
 
 
 def print_retry(error: ModelError, delay: float, attempt: int) -> None:
@@ -134,16 +156,26 @@ def print_summary(report: SummaryReport) -> None:
     )
 
 
-def print_total_usage(result: AgentResult) -> None:
-    """Show the token totals for the run. Silent if none were reported."""
-    usage = result.usage
+def print_total_usage(result: AgentResult, subagents: SubAgents) -> None:
+    """Show the token totals for the run. Silent if none were reported.
+
+    The totals include what sub-agents used. "last request" is the main
+    agent's own history, which is what sub-agents keep small.
+    """
+    usage = result.usage + subagents.usage
     if usage == Usage():
         return
-    print(
+    line = (
         f"  tokens: {usage.input_tokens:,} in ({usage.cached_tokens:,} cached), "
-        f"{usage.output_tokens:,} out; last request {result.context_tokens:,}",
-        file=sys.stderr,
+        f"{usage.output_tokens:,} out; last request {result.context_tokens:,}"
     )
+    if subagents.runs:
+        noun = "run" if subagents.runs == 1 else "runs"
+        line += (
+            f"; {subagents.runs} sub-agent {noun} used "
+            f"{subagents.usage.input_tokens:,} of the tokens in"
+        )
+    print(line, file=sys.stderr)
 
 
 def approve_everything(call: ToolCall, preview: str) -> bool:
@@ -195,9 +227,17 @@ def main(
         if approve is None:
             approve = approve_everything if args.yes else ask_on_terminal
 
+        workspace = Workspace(Path.cwd())
+        subagents = SubAgents(
+            client,
+            research_tools(workspace),
+            context_budget=args.context_budget,
+            on_tool=print_sub_tool_call,
+            on_usage=print_sub_step_usage,
+        )
         agent = Agent(
             client,
-            tools=default_tools(Workspace(Path.cwd())),
+            tools=[*default_tools(workspace), subagents.tool()],
             system=system_prompt(),
             max_steps=args.max_steps,
             on_tool=print_tool_call,
@@ -208,7 +248,7 @@ def main(
             on_summary=print_summary,
         )
         result = agent.run(args.task)
-        print_total_usage(result)
+        print_total_usage(result, subagents)
         print(result.text)
         return 0 if result.finished else 1
     except (ConfigError, ModelError) as error:
