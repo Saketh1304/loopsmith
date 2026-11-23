@@ -17,7 +17,7 @@ from loopsmith.config import API_KEY_VAR
 from loopsmith.llm import ModelError, ToolCall
 from loopsmith.llm.fake import FakeClient
 from loopsmith.sandbox import (
-    DEFAULT_IMAGE,
+    IMAGE_DESCRIPTION,
     CommandResult,
     CommandTimedOut,
     DockerExecutor,
@@ -76,7 +76,12 @@ class FakeDocker:
         return [args for args, _ in self.calls if args[1] == subcommand][-1]
 
 
+# Any image name will do for these tests: the fake runs nothing.
+STAND_IN_IMAGE = "python:3.12-slim"
+
+
 def executor(tmp_path, docker: FakeDocker, **options) -> DockerExecutor:
+    options.setdefault("image", STAND_IN_IMAGE)
     return DockerExecutor(tmp_path, run_process=docker, **options)
 
 
@@ -97,7 +102,7 @@ def test_start_runs_a_long_lived_container_with_the_project_mounted(tmp_path):
     assert args[args.index("--volume") + 1] == f"{tmp_path}:/workspace"
     assert args[args.index("--workdir") + 1] == "/workspace"
     # The container just waits; commands arrive later with docker exec.
-    assert args[-3:] == [DEFAULT_IMAGE, "sleep", "infinity"]
+    assert args[-3:] == [STAND_IN_IMAGE, "sleep", "infinity"]
     assert box.container is not None
     assert box.container.startswith("loopsmith-")
     assert args[args.index("--name") + 1] == box.container
@@ -433,7 +438,15 @@ def test_where_tells_the_model_it_is_a_linux_container(tmp_path):
     where = executor(tmp_path, FakeDocker()).where
 
     assert "Linux container" in where
-    assert DEFAULT_IMAGE in where
+    assert STAND_IN_IMAGE in where
+
+
+def test_where_says_what_is_in_the_image_when_told(tmp_path):
+    box = executor(
+        tmp_path, FakeDocker(), image="loopsmith-sandbox:abc", image_description=IMAGE_DESCRIPTION
+    )
+
+    assert "(Docker image loopsmith-sandbox:abc: Python 3.12 with pytest and git)" in box.where
 
 
 # --- Stopping ---
@@ -488,8 +501,9 @@ class FakeSandbox:
     made: list["FakeSandbox"] = []
     fail_to_start = False
 
-    def __init__(self, root, image, user=None, network=False):
+    def __init__(self, root, image, user=None, network=False, image_description=None):
         self.image = image
+        self.image_description = image_description
         self.network = network
         self.started = False
         self.stopped = False
@@ -509,12 +523,34 @@ class FakeSandbox:
         return CommandResult(0, "ran in the box")
 
 
+LOOPSMITH_IMAGE = "loopsmith-sandbox:fake"
+
+
+class FakeImageBuilder:
+    """Replaces ensure_image inside the CLI: no Docker, no build."""
+
+    def __init__(self):
+        self.calls = 0
+        self.needs_build = False  # when True, it reports a first-time build
+        self.error: SandboxError | None = None
+
+    def __call__(self, on_build=None):
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        if self.needs_build and on_build is not None:
+            on_build(LOOPSMITH_IMAGE)
+        return LOOPSMITH_IMAGE
+
+
 @pytest.fixture
 def fake_sandbox(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(loopsmith.cli, "DockerExecutor", FakeSandbox)
     monkeypatch.setattr(FakeSandbox, "made", [])
     monkeypatch.setattr(FakeSandbox, "fail_to_start", False)
+    FakeSandbox.images = FakeImageBuilder()
+    monkeypatch.setattr(loopsmith.cli, "ensure_image", FakeSandbox.images)
     return FakeSandbox
 
 
@@ -525,7 +561,9 @@ def test_sandbox_flag_runs_commands_in_the_container(fake_sandbox, capsys):
 
     assert exit_code == 0
     [box] = fake_sandbox.made
-    assert box.image == DEFAULT_IMAGE
+    # loopsmith's own image, and the model is told what is in it.
+    assert box.image == LOOPSMITH_IMAGE
+    assert box.image_description == IMAGE_DESCRIPTION
     assert box.network is False
     assert box.commands == ["pytest"]
     assert (box.started, box.stopped) == (True, True)
@@ -534,9 +572,34 @@ def test_sandbox_flag_runs_commands_in_the_container(fake_sandbox, capsys):
     assert "Commands run inside a fake container." in system
     assert history[-1].tool_results[0].content == "exit code: 0\nran in the box"
     assert (
-        f"starting the sandbox container ({DEFAULT_IMAGE}, no network)"
+        f"starting the sandbox container ({LOOPSMITH_IMAGE}, no network)"
         in capsys.readouterr().err
     )
+
+
+def test_the_first_run_builds_the_image_and_says_so(fake_sandbox, capsys):
+    fake_sandbox.images.needs_build = True
+
+    main(["hi", "--sandbox"], client=FakeClient(["Hi."]))
+
+    err = capsys.readouterr().err
+    assert f"building the sandbox image {LOOPSMITH_IMAGE}: first time only" in err
+    # Built before the container starts, which is what uses it.
+    assert err.index("building the sandbox image") < err.index("starting the sandbox container")
+
+
+def test_an_image_that_cannot_be_built_stops_the_run_before_any_model_call(
+    fake_sandbox, capsys
+):
+    fake_sandbox.images.error = SandboxError("Docker could not build the sandbox image.")
+    client = FakeClient(["never used"])
+
+    exit_code = main(["hi", "--sandbox"], client=client)
+
+    assert exit_code == 1
+    assert "Error: Docker could not build the sandbox image." in capsys.readouterr().err
+    assert fake_sandbox.made == []
+    assert client.calls == []
 
 
 def test_the_sandbox_network_flag_reaches_the_container(fake_sandbox, capsys):
@@ -565,7 +628,12 @@ def test_sandbox_options_without_the_sandbox_are_refused(fake_sandbox, capsys, f
 def test_the_sandbox_image_can_be_chosen_on_the_command_line(fake_sandbox):
     main(["hi", "--sandbox", "--sandbox-image", "python:3.13-slim"], client=FakeClient(["Hi."]))
 
-    assert fake_sandbox.made[0].image == "python:3.13-slim"
+    box = fake_sandbox.made[0]
+    assert box.image == "python:3.13-slim"
+    # Someone else's image: nothing to build, and nothing to tell the model
+    # about what is inside it.
+    assert fake_sandbox.images.calls == 0
+    assert box.image_description is None
 
 
 def test_the_container_is_stopped_even_when_the_run_fails(fake_sandbox):

@@ -1,5 +1,6 @@
 """Tests against real Docker. Skipped unless asked for, because they need
-Docker running and download an image the first time:
+Docker running, and the first run builds loopsmith's image, which needs
+the network:
 
     $env:LOOPSMITH_DOCKER_TESTS = "1"; pytest tests/test_docker_live.py
 
@@ -8,12 +9,19 @@ loopsmith builds really work with Docker.
 """
 
 import os
+import shutil
 import subprocess
 
 import pytest
 
 from loopsmith.config import API_KEY_VAR
-from loopsmith.sandbox import CommandTimedOut, DockerExecutor, current_user
+from loopsmith.sandbox import (
+    IMAGE_DESCRIPTION,
+    CommandTimedOut,
+    DockerExecutor,
+    current_user,
+    ensure_image,
+)
 from loopsmith.sandbox.docker import cpu_limit
 
 pytestmark = pytest.mark.skipif(
@@ -31,9 +39,23 @@ def container_exists(name: str) -> bool:
     return bool(listed.stdout.strip())
 
 
+@pytest.fixture(scope="session")
+def sandbox_image():
+    """loopsmith's own image, built the first time (scope="session": once
+    for the whole test run, then shared by every test)."""
+    return ensure_image()
+
+
+def open_box(root, image, **options) -> DockerExecutor:
+    """A sandbox on loopsmith's image, as `loopsmith --sandbox` makes one."""
+    return DockerExecutor(
+        root, image=image, user=current_user(), image_description=IMAGE_DESCRIPTION, **options
+    )
+
+
 @pytest.fixture
-def box(tmp_path):
-    with DockerExecutor(tmp_path, user=current_user()) as executor:
+def box(tmp_path, sandbox_image):
+    with open_box(tmp_path, sandbox_image) as executor:
         yield executor
 
 
@@ -56,10 +78,10 @@ def test_files_made_in_the_container_appear_in_the_project_folder(box, tmp_path)
     assert (tmp_path / "made.txt").read_text(encoding="utf-8") == "hello\n"
 
 
-def test_the_api_key_is_not_inside_the_container(tmp_path, monkeypatch):
+def test_the_api_key_is_not_inside_the_container(tmp_path, monkeypatch, sandbox_image):
     monkeypatch.setenv(API_KEY_VAR, "super-secret")
 
-    with DockerExecutor(tmp_path, user=current_user()) as box:
+    with open_box(tmp_path, sandbox_image) as box:
         result = box.run("env", 60)
 
     assert "super-secret" not in result.output
@@ -76,21 +98,70 @@ def test_a_timeout_removes_the_container_with_the_stuck_command(box):
     assert box.run("echo still working", 60).output == "still working\n"
 
 
-def test_stopping_removes_the_container(tmp_path):
-    with DockerExecutor(tmp_path, user=current_user()) as box:
+def test_stopping_removes_the_container(tmp_path, sandbox_image):
+    with open_box(tmp_path, sandbox_image) as box:
         name = box.container
         assert container_exists(name)
 
     assert not container_exists(name)
 
 
+# --- loopsmith's own image (decision 66) ---
+
+
+def test_the_image_has_python_pytest_and_git(box):
+    result = box.run("python --version && pytest --version && git --version", 60)
+
+    assert result.exit_code == 0
+    assert "Python 3.12." in result.output
+    assert "pytest 9.2.0" in result.output
+    assert "git version" in result.output
+
+
+def test_a_projects_tests_run_with_the_network_off(box, tmp_path):
+    # The point of the image: "run the tests" works inside the sandbox.
+    (tmp_path / "test_sample.py").write_bytes(
+        b"def test_passes():\n    assert 1 + 1 == 2\n\n\n"
+        b"def test_fails():\n    assert 1 + 1 == 3\n"
+    )
+
+    result = box.run("pytest -q -p no:cacheprovider", 120)
+
+    assert result.exit_code == 1  # pytest's code for "some tests failed"
+    assert "1 failed, 1 passed" in result.output
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git on this machine")
+def test_git_reads_the_history_but_cannot_change_it(tmp_path, sandbox_image):
+    identity = ["-c", "user.name=Test", "-c", "user.email=test@example.com"]
+    subprocess.run(["git", "-C", str(tmp_path), "init", "-q"], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), *identity, "commit", "-q", "--allow-empty", "-m", "first"],
+        check=True,
+    )
+
+    with open_box(tmp_path, sandbox_image) as box:
+        log = box.run("git log --format=%s", 60)
+        status = box.run("git status --short", 60)
+        commit = box.run(
+            "git -c user.name=Agent -c user.email=agent@example.com "
+            "commit --allow-empty -m second",
+            60,
+        )
+
+    assert (log.exit_code, log.output) == (0, "first\n")
+    assert status.exit_code == 0
+    assert commit.exit_code != 0
+    assert "Read-only file system" in commit.output
+
+
 # --- The project's history and secrets ---
 
 
-def test_secret_files_look_empty_and_cannot_be_changed(tmp_path):
+def test_secret_files_look_empty_and_cannot_be_changed(tmp_path, sandbox_image):
     (tmp_path / ".env").write_text("FAKE_SECRET=not-a-real-key\n", encoding="utf-8")
 
-    with DockerExecutor(tmp_path, user=current_user()) as box:
+    with open_box(tmp_path, sandbox_image) as box:
         read = box.run("cat .env", 60)
         write = box.run("echo stolen > .env", 60)
 
@@ -100,11 +171,11 @@ def test_secret_files_look_empty_and_cannot_be_changed(tmp_path):
     assert (tmp_path / ".env").read_text(encoding="utf-8") == "FAKE_SECRET=not-a-real-key\n"
 
 
-def test_the_git_history_cannot_be_changed(tmp_path):
+def test_the_git_history_cannot_be_changed(tmp_path, sandbox_image):
     (tmp_path / ".git").mkdir()
     (tmp_path / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
 
-    with DockerExecutor(tmp_path, user=current_user()) as box:
+    with open_box(tmp_path, sandbox_image) as box:
         removed = box.run("rm -rf .git", 60)
         read = box.run("cat .git/HEAD", 60)
 
@@ -122,8 +193,8 @@ def test_the_container_has_no_network(box):
     assert box.run("ls /sys/class/net", 60).output.split() == ["lo"]
 
 
-def test_the_network_can_be_allowed(tmp_path):
-    with DockerExecutor(tmp_path, user=current_user(), network=True) as box:
+def test_the_network_can_be_allowed(tmp_path, sandbox_image):
+    with open_box(tmp_path, sandbox_image, network=True) as box:
         interfaces = box.run("ls /sys/class/net", 60).output.split()
 
     assert "lo" in interfaces

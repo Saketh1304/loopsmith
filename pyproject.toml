@@ -19,6 +19,11 @@ loopsmith = "loopsmith.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# Files that are not Python but belong to the package: the sandbox image's
+# Dockerfile. Without this, an installed copy of loopsmith would lack it.
+[tool.setuptools.package-data]
+"loopsmith.sandbox" = ["*.Dockerfile"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]

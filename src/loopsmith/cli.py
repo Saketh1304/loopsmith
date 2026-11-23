@@ -19,12 +19,13 @@ from loopsmith.llm import ModelClient, ModelError, ToolCall, ToolResult, Usage
 from loopsmith.llm.gemini import GeminiClient
 from loopsmith.llm.retry import RetryingClient
 from loopsmith.sandbox import (
-    DEFAULT_IMAGE,
+    IMAGE_DESCRIPTION,
     DockerExecutor,
     Executor,
     LocalExecutor,
     SandboxError,
     current_user,
+    ensure_image,
 )
 from loopsmith.subagent import SubAgents
 from loopsmith.tools import Workspace, default_tools, research_tools
@@ -107,7 +108,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--sandbox-image",
-        help=f"the Docker image for --sandbox (default {DEFAULT_IMAGE})",
+        help="a Docker image for --sandbox to use instead of loopsmith's own "
+        f"({IMAGE_DESCRIPTION}, built the first time it is needed)",
     )
     parser.add_argument(
         "--sandbox-network",
@@ -256,16 +258,33 @@ def print_total_usage(result: AgentResult, subagents: SubAgents) -> None:
     print(line, file=sys.stderr)
 
 
+def print_image_build(tag: str) -> None:
+    print(
+        f"  .. building the sandbox image {tag}: first time only, needs the network, "
+        "takes a minute or two",
+        file=sys.stderr,
+    )
+
+
 def make_executor(args: argparse.Namespace, root: Path) -> Executor:
     """Where run_command's commands run: this machine, or with --sandbox a
     Docker container, started here. Raises SandboxError if it cannot start."""
     if not args.sandbox:
         return LocalExecutor(root)
-    image = args.sandbox_image or DEFAULT_IMAGE
+    if args.sandbox_image:
+        # Someone else's image: Docker downloads it if needed, and loopsmith
+        # cannot say what is in it.
+        image, description = args.sandbox_image, None
+    else:
+        image, description = ensure_image(on_build=print_image_build), IMAGE_DESCRIPTION
     network = "with network" if args.sandbox_network else "no network"
     print(f"  .. starting the sandbox container ({image}, {network})", file=sys.stderr)
     executor = DockerExecutor(
-        root, image=image, user=current_user(), network=args.sandbox_network
+        root,
+        image=image,
+        user=current_user(),
+        network=args.sandbox_network,
+        image_description=description,
     )
     executor.start()
     return executor

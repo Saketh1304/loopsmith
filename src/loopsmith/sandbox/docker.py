@@ -22,8 +22,12 @@ from typing import Callable
 from loopsmith.sandbox.base import CommandResult, CommandTimedOut
 from loopsmith.secret_files import find_secret_files
 
-DEFAULT_IMAGE = "python:3.12-slim"
 CONTAINER_WORKDIR = "/workspace"
+
+DOCKER_MISSING_MESSAGE = (
+    "Docker is not installed, or `docker` is not on the PATH. "
+    "Install Docker Desktop, or run without --sandbox."
+)
 
 # Every loopsmith container carries this label. If loopsmith is killed
 # before it can clean up, the leftovers can be found and removed with:
@@ -102,13 +106,19 @@ class DockerExecutor:
     def __init__(
         self,
         root: Path,
-        image: str = DEFAULT_IMAGE,
+        image: str,
         run_process: ProcessRunner = run_process,
         user: str | None = None,
         network: bool = False,
+        image_description: str | None = None,
     ):
         self._root = root
+        # Which image to run is the caller's choice; making sure it exists
+        # is too (see image.py). This class only runs containers.
         self._image = image
+        # What the image holds, in words for the model, such as "Python 3.12
+        # with pytest and git". None for an image loopsmith knows nothing about.
+        self._image_description = image_description
         self._run_process = run_process
         self._user = user
         # Off unless asked for (decision 53). The agent's own model calls
@@ -124,8 +134,11 @@ class DockerExecutor:
         """Also tells the model what the box allows, so it does not waste
         steps trying to download things or write outside the project."""
         network = "network access" if self._network else "no network access"
+        image = f"Docker image {self._image}"
+        if self._image_description:
+            image += f": {self._image_description}"
         return (
-            f"inside a Linux container (Docker image {self._image}) through sh. "
+            f"inside a Linux container ({image}) through sh. "
             f"It has {network}, at most {MEMORY_LIMIT_TEXT} of memory, and only "
             "the project folder and /tmp can be written to. The .git folder is "
             "read-only, and .env files look empty"
@@ -196,10 +209,7 @@ class DockerExecutor:
         try:
             code, output = self._run_process(args, START_TIMEOUT_SECONDS)
         except FileNotFoundError:
-            error = SandboxError(
-                "Docker is not installed, or `docker` is not on the PATH. "
-                "Install Docker Desktop, or run without --sandbox."
-            )
+            error = SandboxError(DOCKER_MISSING_MESSAGE)
         except subprocess.TimeoutExpired:
             error = SandboxError(
                 f"Docker did not start the container within {START_TIMEOUT_SECONDS} "
