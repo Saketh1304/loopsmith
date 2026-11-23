@@ -3,6 +3,7 @@
 Usage:
     loopsmith "what does this project do?"
     loopsmith "add a docstring to utils.py" --yes
+    loopsmith "run the tests and fix what fails" --sandbox
     loopsmith --list-models
 """
 
@@ -17,7 +18,14 @@ from loopsmith.context import DEFAULT_CONTEXT_BUDGET, SummaryReport, TrimReport
 from loopsmith.llm import ModelClient, ModelError, ToolCall, ToolResult, Usage
 from loopsmith.llm.gemini import GeminiClient
 from loopsmith.llm.retry import RetryingClient
-from loopsmith.sandbox import Executor, LocalExecutor
+from loopsmith.sandbox import (
+    DEFAULT_IMAGE,
+    DockerExecutor,
+    Executor,
+    LocalExecutor,
+    SandboxError,
+    current_user,
+)
 from loopsmith.subagent import SubAgents
 from loopsmith.tools import Workspace, default_tools, research_tools
 
@@ -84,6 +92,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--yes",
         action="store_true",
         help="approve every file change and command without asking",
+    )
+    parser.add_argument(
+        "--sandbox",
+        action="store_true",
+        help="run commands inside a Docker container that sees only this folder "
+        "(needs Docker Desktop running)",
+    )
+    parser.add_argument(
+        "--sandbox-image",
+        default=DEFAULT_IMAGE,
+        help=f"the Docker image for --sandbox (default {DEFAULT_IMAGE})",
     )
     parser.add_argument(
         "--version", action="version", version=f"loopsmith {__version__}"
@@ -222,6 +241,17 @@ def print_total_usage(result: AgentResult, subagents: SubAgents) -> None:
     print(line, file=sys.stderr)
 
 
+def make_executor(args: argparse.Namespace, root: Path) -> Executor:
+    """Where run_command's commands run: this machine, or with --sandbox a
+    Docker container, started here. Raises SandboxError if it cannot start."""
+    if not args.sandbox:
+        return LocalExecutor(root)
+    print(f"  .. starting the sandbox container ({args.sandbox_image})", file=sys.stderr)
+    executor = DockerExecutor(root, image=args.sandbox_image, user=current_user())
+    executor.start()
+    return executor
+
+
 def approve_everything(call: ToolCall, preview: str) -> bool:
     return True
 
@@ -272,35 +302,39 @@ def main(
             approve = approve_everything if args.yes else ask_on_terminal
 
         workspace = Workspace(Path.cwd())
-        # Where run_command runs. For now always this machine; the Docker
-        # sandbox will be chosen here too.
-        executor = LocalExecutor(workspace.root)
-        subagents = SubAgents(
-            client,
-            research_tools(workspace),
-            context_budget=args.context_budget,
-            on_tool=print_sub_tool_call,
-            on_usage=print_sub_step_usage,
-            on_trim=print_sub_trim,
-            on_summary=print_sub_summary,
-        )
-        agent = Agent(
-            client,
-            tools=[*default_tools(workspace, executor), subagents.tool()],
-            system=system_prompt(executor),
-            max_steps=args.max_steps,
-            on_tool=print_tool_call,
-            approve=approve,
-            on_usage=print_step_usage,
-            context_budget=args.context_budget,
-            on_trim=print_trim,
-            on_summary=print_summary,
-        )
-        result = agent.run(args.task)
+        # Started before the first model call, so a Docker problem costs no
+        # requests. Stopped in `finally`, whatever happens during the run.
+        executor = make_executor(args, workspace.root)
+        try:
+            subagents = SubAgents(
+                client,
+                research_tools(workspace),
+                context_budget=args.context_budget,
+                on_tool=print_sub_tool_call,
+                on_usage=print_sub_step_usage,
+                on_trim=print_sub_trim,
+                on_summary=print_sub_summary,
+            )
+            agent = Agent(
+                client,
+                tools=[*default_tools(workspace, executor), subagents.tool()],
+                system=system_prompt(executor),
+                max_steps=args.max_steps,
+                on_tool=print_tool_call,
+                approve=approve,
+                on_usage=print_step_usage,
+                context_budget=args.context_budget,
+                on_trim=print_trim,
+                on_summary=print_summary,
+            )
+            result = agent.run(args.task)
+        finally:
+            if isinstance(executor, DockerExecutor):
+                executor.stop()
         print_total_usage(result, subagents)
         print(result.text)
         return 0 if result.finished else 1
-    except (ConfigError, ModelError) as error:
+    except (ConfigError, ModelError, SandboxError) as error:
         print(f"Error: {error}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
