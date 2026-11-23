@@ -20,3 +20,20 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: pip install -e ".[dev]"
       - run: pytest
+
+  # The tests against real Docker (decision 64). They are skipped in the
+  # job above and on a normal `pytest` run. GitHub's Ubuntu machines come
+  # with Docker, and they use the cgroup v2 file layout, which Docker
+  # Desktop on the development machine does not, so both layouts of the
+  # limit files get tested.
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -e ".[dev]"
+      - run: pytest tests/test_docker_live.py -v
+        env:
+          LOOPSMITH_DOCKER_TESTS: "1"

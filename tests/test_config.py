@@ -153,6 +153,29 @@ def test_only_loopsmiths_own_settings_are_loaded(tmp_path, monkeypatch):
     assert "DB_PASSWORD" not in os.environ
 
 
+# --- No test sees another test's settings, or the user's real ones ---
+# (the shared fixture in conftest.py; decision 65)
+
+
+def test_a_setting_written_straight_into_the_environment_part_1():
+    os.environ[API_KEY_VAR] = "written-directly"  # as load_env_file does
+
+
+def test_a_setting_written_straight_into_the_environment_part_2():
+    # pytest runs the tests of a file in order, so part 1 has just run.
+    # Its setting must not have outlived it.
+    assert API_KEY_VAR not in os.environ
+
+
+def test_inside_tests_the_search_for_a_settings_file_finds_nothing(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text(f"{API_KEY_VAR}=real-looking\n", encoding="utf-8")
+
+    load_env_file()  # what main() calls: no path, so it would search
+
+    assert API_KEY_VAR not in os.environ
+
+
 def test_no_file_anywhere_returns_none(tmp_path, fake_home):
     project = tmp_path / "project"
     project.mkdir()
