@@ -70,14 +70,18 @@ def backoff_delay(attempt: int, retry_after: float | None = None) -> float:
 
     Double the wait each time (2s, 4s, 8s...) and add a random part, so
     that many clients that failed together do not all retry at the same
-    instant. If the server said how long to wait, wait at least that long.
+    instant. Our own wait is capped at a minute.
 
-    The server's figure is a minimum, never a shortcut. Gemini sometimes
-    suggests a wait of under a second, and retrying that quickly just
-    fails again and uses up one of the few attempts.
+    If the server said how long to wait, wait at least that long, even
+    past the cap (decision 58): a retry before the server's time can only
+    fail again. Waits too long to sit through never get here; the client
+    stops at LONG_WAIT_SECONDS instead. The server's figure is a minimum,
+    never a shortcut: Gemini sometimes suggests under a second, and
+    retrying that quickly just fails again.
     """
     delay = BASE_DELAY_SECONDS * (2 ** (attempt - 1))
     delay += random.uniform(0, delay / 2)
+    delay = min(delay, MAX_DELAY_SECONDS)
     if retry_after is not None:
         delay = max(delay, retry_after)
-    return min(delay, MAX_DELAY_SECONDS)
+    return delay

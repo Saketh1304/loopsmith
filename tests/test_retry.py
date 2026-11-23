@@ -85,7 +85,13 @@ def test_backoff_doubles_and_is_capped():
     assert 4.0 <= backoff_delay(2) <= 6.0
     assert 8.0 <= backoff_delay(3) <= 12.0
     assert backoff_delay(20) == MAX_DELAY_SECONDS
-    assert backoff_delay(1, retry_after=500.0) == MAX_DELAY_SECONDS
+
+
+def test_the_servers_wait_wins_even_past_our_own_cap():
+    # Retrying after 60 seconds when the server said 120 can only fail
+    # again and waste an attempt.
+    assert backoff_delay(1, retry_after=120.0) == 120.0
+    assert backoff_delay(20, retry_after=200.0) == 200.0
 
 
 def test_a_tiny_server_delay_does_not_shorten_the_backoff():
@@ -112,10 +118,11 @@ def test_a_very_long_server_wait_is_not_retried():
     assert waits == []
 
 
-def test_a_wait_of_a_few_minutes_is_still_retried():
+def test_a_wait_of_a_few_minutes_is_retried_after_the_full_wait():
     inner = FlakyClient([rate_limited(retry_after=120.0)])
     waits = []
 
     RetryingClient(inner, sleep=waits.append).generate([Message("user", "hi")])
 
-    assert waits == [MAX_DELAY_SECONDS]
+    assert waits == [120.0]
+    assert inner.attempts == 2

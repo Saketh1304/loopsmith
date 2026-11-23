@@ -20,6 +20,9 @@ from loopsmith.llm.http import Transport, send_json
 
 BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
+# Empty answers worth asking for again (see parse_reply).
+RETRYABLE_FINISH_REASONS = {"MALFORMED_FUNCTION_CALL"}
+
 
 class GeminiClient:
     """Implements ModelClient for the Gemini API."""
@@ -186,7 +189,14 @@ def parse_reply(body: dict) -> ModelReply:
     parts = candidate.get("content", {}).get("parts", [])
     if not parts:
         reason = candidate.get("finishReason", "unknown")
-        raise ModelError(f"The model returned an empty answer (finish reason: {reason}).")
+        # A malformed tool call is a slip in the model's output, and the
+        # model samples differently each time, so asking again usually
+        # works. Other empty answers (a safety block, for one) would come
+        # back the same, so they stay final (decision 59).
+        raise ModelError(
+            f"The model returned an empty answer (finish reason: {reason}).",
+            retryable=reason in RETRYABLE_FINISH_REASONS,
+        )
 
     # Skip "thought" parts: those are the model's reasoning, not its answer.
     text = "".join(

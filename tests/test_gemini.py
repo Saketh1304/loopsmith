@@ -2,6 +2,7 @@ import pytest
 
 from loopsmith.llm import Message, ModelError, ToolCall, ToolResult, ToolSpec, Usage
 from loopsmith.llm.gemini import GeminiClient, build_request_body, format_wait, parse_reply
+from loopsmith.llm.retry import RetryingClient
 
 
 class RecordingTransport:
@@ -270,6 +271,42 @@ def test_empty_answer_reports_the_finish_reason():
 
     with pytest.raises(ModelError, match="MALFORMED_FUNCTION_CALL"):
         parse_reply(body)
+
+
+def test_a_malformed_tool_call_can_be_retried():
+    body = {"candidates": [{"content": {}, "finishReason": "MALFORMED_FUNCTION_CALL"}]}
+
+    with pytest.raises(ModelError) as error_info:
+        parse_reply(body)
+
+    assert error_info.value.retryable is True
+
+
+def test_an_answer_blocked_for_safety_is_not_retried():
+    # The same request would be blocked again.
+    body = {"candidates": [{"content": {}, "finishReason": "SAFETY"}]}
+
+    with pytest.raises(ModelError) as error_info:
+        parse_reply(body)
+
+    assert error_info.value.retryable is False
+
+
+def test_a_run_survives_one_malformed_tool_call():
+    class ScriptedTransport:
+        def __init__(self, bodies):
+            self._bodies = list(bodies)
+
+        def __call__(self, method, url, headers, body):
+            return 200, self._bodies.pop(0)
+
+    malformed = {"candidates": [{"content": {}, "finishReason": "MALFORMED_FUNCTION_CALL"}]}
+    client = RetryingClient(
+        GeminiClient("key", "some-model", ScriptedTransport([malformed, reply_body("done")])),
+        sleep=lambda seconds: None,
+    )
+
+    assert client.generate([Message("user", "hello")]).text == "done"
 
 
 def test_rate_limit_error_carries_the_servers_retry_delay():
