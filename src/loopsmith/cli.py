@@ -7,7 +7,6 @@ Usage:
 """
 
 import argparse
-import platform
 import sys
 from pathlib import Path
 
@@ -18,12 +17,18 @@ from loopsmith.context import DEFAULT_CONTEXT_BUDGET, SummaryReport, TrimReport
 from loopsmith.llm import ModelClient, ModelError, ToolCall, ToolResult, Usage
 from loopsmith.llm.gemini import GeminiClient
 from loopsmith.llm.retry import RetryingClient
+from loopsmith.sandbox import Executor, LocalExecutor
 from loopsmith.subagent import SubAgents
 from loopsmith.tools import Workspace, default_tools, research_tools
 
 
-def system_prompt() -> str:
-    """Standing instructions sent with every model call."""
+def system_prompt(executor: Executor | None = None) -> str:
+    """Standing instructions sent with every model call.
+
+    The executor says where commands run, so the model knows which shell
+    and which operating system to write commands for.
+    """
+    where = (executor or LocalExecutor(Path.cwd())).where
     return (
         "You are loopsmith, a careful coding agent working inside a project "
         "folder. All paths are relative to that folder.\n"
@@ -42,8 +47,8 @@ def system_prompt() -> str:
         "sub-agent does the reading and gives you only its findings, which "
         "keeps this conversation short. Read a file yourself when you are "
         "about to edit it.\n"
-        f"- Commands run on {platform.system()} through the system shell. They "
-        "cannot ask for keyboard input and are stopped after a time limit.\n"
+        f"- Commands run {where}. They cannot ask for keyboard input and are "
+        "stopped after a time limit.\n"
         "- The user approves each change and command. If one is declined, do "
         "not repeat it.\n"
         "When the task is done, reply with a short summary of what you did."
@@ -267,6 +272,9 @@ def main(
             approve = approve_everything if args.yes else ask_on_terminal
 
         workspace = Workspace(Path.cwd())
+        # Where run_command runs. For now always this machine; the Docker
+        # sandbox will be chosen here too.
+        executor = LocalExecutor(workspace.root)
         subagents = SubAgents(
             client,
             research_tools(workspace),
@@ -278,8 +286,8 @@ def main(
         )
         agent = Agent(
             client,
-            tools=[*default_tools(workspace), subagents.tool()],
-            system=system_prompt(),
+            tools=[*default_tools(workspace, executor), subagents.tool()],
+            system=system_prompt(executor),
             max_steps=args.max_steps,
             on_tool=print_tool_call,
             approve=approve,

@@ -1,14 +1,12 @@
 """A tool that runs shell commands in the workspace.
 
-This is the most powerful and the most dangerous tool. A command can do
-anything the user's account can do, so it always needs approval, and it
-runs with a time limit and without the API key in its environment.
+This is the most powerful and the most dangerous tool, so it always needs
+approval and runs with a time limit. Where the command actually runs is
+up to an executor (see loopsmith.sandbox): on this machine by default.
+This file only decides what the model is told about it.
 """
 
-import os
-import subprocess
-
-from loopsmith.config import API_KEY_VAR
+from loopsmith.sandbox import CommandTimedOut, Executor, LocalExecutor
 from loopsmith.tools.base import Tool, ToolError, require_string
 from loopsmith.tools.files import Workspace
 
@@ -30,38 +28,31 @@ def _shorten(output: str) -> str:
 
 
 def run_command_tool(
-    workspace: Workspace, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
+    workspace: Workspace,
+    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+    executor: Executor | None = None,
 ) -> Tool:
+    # The same injection-with-a-default as GeminiClient's transport: real
+    # use gets this machine, a test or the sandbox passes its own.
+    runner = executor if executor is not None else LocalExecutor(workspace.root)
+
     def preview(args: dict) -> str:
         return f"Run command: {require_string(args, 'command')}"
 
     def run(args: dict) -> str:
         command = require_string(args, "command")
-        # The child process must not inherit the model API key.
-        environment = {k: v for k, v in os.environ.items() if k != API_KEY_VAR}
         try:
-            completed = subprocess.run(
-                command,
-                shell=True,
-                cwd=workspace.root,
-                env=environment,
-                stdin=subprocess.DEVNULL,  # a command that waits for input fails fast
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,  # one stream, in the order it was printed
-                timeout=timeout_seconds,
-                encoding="utf-8",
-                errors="replace",
-            )
-        except subprocess.TimeoutExpired:
+            result = runner.run(command, timeout_seconds)
+        except CommandTimedOut:
             raise ToolError(
                 f"The command did not finish within {timeout_seconds} seconds "
                 "and was stopped. Do not run servers or commands that wait for input."
             ) from None
 
-        output = _shorten(completed.stdout or "").strip() or "(no output)"
+        output = _shorten(result.output).strip() or "(no output)"
         # A non-zero exit code is a normal result, not a tool error: the
         # model needs to read a failing test's output to fix the code.
-        return f"exit code: {completed.returncode}\n{output}"
+        return f"exit code: {result.exit_code}\n{output}"
 
     return Tool(
         name="run_command",
