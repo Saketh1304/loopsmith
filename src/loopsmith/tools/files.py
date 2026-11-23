@@ -3,6 +3,7 @@
 import difflib
 from pathlib import Path
 
+from loopsmith.secret_files import is_secrets_file
 from loopsmith.tools.base import Tool, ToolError, require_string
 
 MAX_FILE_CHARS = 40_000
@@ -45,12 +46,6 @@ class Workspace:
 
     def display(self, path: Path) -> str:
         return path.relative_to(self.root).as_posix() or "."
-
-
-def is_secrets_file(path: Path) -> bool:
-    """True for .env files, except the key-free .env.example template."""
-    name = path.name.lower()
-    return name == ".env" or (name.startswith(".env.") and name != ".env.example")
 
 
 # --- Reading and writing text while keeping the file's line endings ---

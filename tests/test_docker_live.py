@@ -14,6 +14,7 @@ import pytest
 
 from loopsmith.config import API_KEY_VAR
 from loopsmith.sandbox import CommandTimedOut, DockerExecutor, current_user
+from loopsmith.sandbox.docker import cpu_limit
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("LOOPSMITH_DOCKER_TESTS") != "1",
@@ -81,3 +82,110 @@ def test_stopping_removes_the_container(tmp_path):
         assert container_exists(name)
 
     assert not container_exists(name)
+
+
+# --- The project's history and secrets ---
+
+
+def test_secret_files_look_empty_and_cannot_be_changed(tmp_path):
+    (tmp_path / ".env").write_text("FAKE_SECRET=not-a-real-key\n", encoding="utf-8")
+
+    with DockerExecutor(tmp_path, user=current_user()) as box:
+        read = box.run("cat .env", 60)
+        write = box.run("echo stolen > .env", 60)
+
+    assert (read.exit_code, read.output) == (0, "")
+    assert write.exit_code != 0
+    assert "Read-only file system" in write.output
+    assert (tmp_path / ".env").read_text(encoding="utf-8") == "FAKE_SECRET=not-a-real-key\n"
+
+
+def test_the_git_history_cannot_be_changed(tmp_path):
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+
+    with DockerExecutor(tmp_path, user=current_user()) as box:
+        removed = box.run("rm -rf .git", 60)
+        read = box.run("cat .git/HEAD", 60)
+
+    assert removed.exit_code != 0
+    assert read.output == "ref: refs/heads/main\n"  # still there, still readable
+    assert (tmp_path / ".git" / "HEAD").exists()
+
+
+# --- Network, limits and hardening, checked from inside the container ---
+
+
+def test_the_container_has_no_network(box):
+    # Only the loopback interface exists, so there is no way out. Nothing
+    # is sent anywhere to find this out.
+    assert box.run("ls /sys/class/net", 60).output.split() == ["lo"]
+
+
+def test_the_network_can_be_allowed(tmp_path):
+    with DockerExecutor(tmp_path, user=current_user(), network=True) as box:
+        interfaces = box.run("ls /sys/class/net", 60).output.split()
+
+    assert "lo" in interfaces
+    assert len(interfaces) > 1  # a real network interface as well
+
+
+def test_only_the_project_and_tmp_can_be_written(box, tmp_path):
+    blocked = box.run("touch /etc/planted", 60)
+    allowed = box.run("touch /tmp/scratch /workspace/made && echo ok", 60)
+
+    assert blocked.exit_code != 0
+    assert "Read-only file system" in blocked.output
+    assert allowed.output == "ok\n"
+    assert (tmp_path / "made").exists()
+
+
+def test_programs_in_tmp_can_run(box):
+    script = "printf '#!/bin/sh\\necho ran\\n' > /tmp/s.sh && chmod +x /tmp/s.sh && /tmp/s.sh"
+
+    assert box.run(script, 60).output == "ran\n"
+
+
+def test_the_container_has_no_special_powers(box):
+    # grep reads its own status: no capabilities at all, and no way to
+    # gain new privileges.
+    status = box.run("grep -E '^(CapEff|NoNewPrivs):' /proc/self/status", 60)
+
+    assert status.output.split() == ["CapEff:", "0000000000000000", "NoNewPrivs:", "1"]
+
+
+def read_limit(box, *paths: str) -> str:
+    """The contents of the first of these files that exists.
+
+    The kernel keeps a container's limits in its cgroup files. Newer
+    systems use the cgroup v2 layout; others, including some Docker
+    Desktop setups, use v1, where the same limit has another file name.
+    """
+    for path in paths:
+        result = box.run(f"cat {path}", 60)
+        if result.exit_code == 0:
+            return result.output.strip()
+    pytest.fail(f"none of these cgroup files exist: {paths}")
+
+
+def test_the_limits_are_in_force(box):
+    cgroup = "/sys/fs/cgroup"
+
+    memory = read_limit(box, f"{cgroup}/memory.max", f"{cgroup}/memory/memory.limit_in_bytes")
+    processes = read_limit(box, f"{cgroup}/pids.max", f"{cgroup}/pids/pids.max")
+    cpu = read_limit(box, f"{cgroup}/cpu.max", f"{cgroup}/cpu/cpu.cfs_quota_us")
+
+    assert memory == str(2 * 1024**3)
+    assert processes == "512"
+    # CPU time allowed per 100,000 microseconds: 200,000 means two CPUs.
+    assert cpu.split()[0] == str(cpu_limit() * 100_000)
+
+
+def test_running_out_of_memory_is_explained_and_the_box_survives(box):
+    # Filling 2.5 GB goes past the 2 GB limit, so Linux kills the command.
+    result = box.run("python -c \"b = b'x' * (2560 * 1024 ** 2)\"", 120)
+
+    assert result.exit_code == 137
+    assert "most likely for using more than the sandbox's 2 GB of memory" in result.output
+    # Only the command was killed; the container still works.
+    assert box.run("echo alive", 60).output == "alive\n"

@@ -7,11 +7,12 @@ tested in test_docker_live.py, which only runs when asked to.
 
 import os
 import subprocess
+from pathlib import Path
 
 import pytest
 
 import loopsmith.cli
-from loopsmith.cli import main
+from loopsmith.cli import main, system_prompt
 from loopsmith.config import API_KEY_VAR
 from loopsmith.llm import ModelError, ToolCall
 from loopsmith.llm.fake import FakeClient
@@ -23,7 +24,13 @@ from loopsmith.sandbox import (
     SandboxError,
     current_user,
 )
-from loopsmith.sandbox.docker import LABEL
+from loopsmith.sandbox.docker import (
+    LABEL,
+    MEMORY_LIMIT,
+    PIDS_LIMIT,
+    TMP_MOUNT,
+    cpu_limit,
+)
 from loopsmith.tools import Workspace
 from loopsmith.tools.shell import run_command_tool
 
@@ -141,6 +148,212 @@ def test_the_api_key_is_never_given_to_the_container(tmp_path, monkeypatch):
     everything_sent = " ".join(" ".join(args) for args, _ in docker.calls)
     assert "super-secret" not in everything_sent
     assert API_KEY_VAR not in everything_sent
+
+
+# --- Network, limits and hardening ---
+
+
+def option(args: list[str], flag: str) -> str:
+    """The value given after a flag, as in `--memory 2g`."""
+    return args[args.index(flag) + 1]
+
+
+def test_the_container_has_no_network_by_default(tmp_path):
+    docker = FakeDocker()
+
+    executor(tmp_path, docker).start()
+
+    assert option(docker.last("run"), "--network") == "none"
+
+
+def test_the_network_can_be_allowed(tmp_path):
+    docker = FakeDocker()
+
+    executor(tmp_path, docker, network=True).start()
+
+    assert "--network" not in docker.last("run")
+
+
+def test_memory_cpu_and_process_limits_are_set(tmp_path):
+    docker = FakeDocker()
+
+    executor(tmp_path, docker).start()
+
+    args = docker.last("run")
+    assert option(args, "--memory") == MEMORY_LIMIT == "2g"
+    # The same figure for memory-swap means no swap on top of the limit.
+    assert option(args, "--memory-swap") == MEMORY_LIMIT
+    assert option(args, "--cpus") == str(cpu_limit())
+    assert option(args, "--pids-limit") == str(PIDS_LIMIT) == "512"
+
+
+def test_the_cpu_limit_never_asks_for_more_cpus_than_the_machine_has(monkeypatch):
+    monkeypatch.setattr(os, "cpu_count", lambda: 16)
+    assert cpu_limit() == 2
+
+    monkeypatch.setattr(os, "cpu_count", lambda: 1)
+    assert cpu_limit() == 1
+
+    # cpu_count() can return None when Python cannot tell.
+    monkeypatch.setattr(os, "cpu_count", lambda: None)
+    assert cpu_limit() == 1
+
+
+def test_the_container_has_no_special_powers_and_read_only_system_files(tmp_path):
+    docker = FakeDocker()
+
+    executor(tmp_path, docker).start()
+
+    args = docker.last("run")
+    assert option(args, "--cap-drop") == "ALL"
+    assert option(args, "--security-opt") == "no-new-privileges"
+    assert "--read-only" in args
+    # /tmp stays writable, limited in size, and programs in it can run.
+    assert option(args, "--tmpfs") == TMP_MOUNT
+    assert TMP_MOUNT.startswith("/tmp:rw,exec,")
+    assert "size=512m" in TMP_MOUNT
+
+
+def test_where_tells_the_model_there_is_no_network_and_what_is_writable(tmp_path):
+    where = executor(tmp_path, FakeDocker()).where
+
+    assert "no network access" in where
+    assert "at most 2 GB of memory" in where
+    assert "only the project folder and /tmp can be written to" in where
+
+
+def test_where_says_so_when_the_network_is_allowed(tmp_path):
+    where = executor(tmp_path, FakeDocker(), network=True).where
+
+    assert "It has network access" in where
+
+
+def test_the_system_prompt_carries_the_sandbox_rules(tmp_path):
+    prompt = system_prompt(executor(tmp_path, FakeDocker()))
+
+    assert "Commands run inside a Linux container" in prompt
+    assert "no network access" in prompt
+
+
+def test_a_command_killed_with_exit_code_137_is_explained(tmp_path):
+    docker = FakeDocker(exec_result=(137, "building...\n"))
+
+    result = executor(tmp_path, docker).run("make", 30)
+
+    assert result.exit_code == 137
+    assert result.output == (
+        "building...\n\n[The command was killed (exit code 137), most likely for "
+        "using more than the sandbox's 2 GB of memory.]"
+    )
+
+
+def test_the_explanation_survives_when_long_output_is_shortened(tmp_path):
+    docker = FakeDocker(exec_result=(137, "x" * 50_000))
+    tool = run_command_tool(Workspace(tmp_path), executor=executor(tmp_path, docker))
+
+    result = tool.run({"command": "make"})
+
+    assert result.startswith("exit code: 137\n")
+    assert result.endswith("of memory.]")
+
+
+# --- The project's history and secrets ---
+
+
+def mounts(args: list[str]) -> list[str]:
+    """Every `--volume` value, as in `C:\\proj:/workspace`."""
+    return [args[i + 1] for i, word in enumerate(args) if word == "--volume"]
+
+
+def hidden_mounts(args: list[str]) -> list[tuple[Path, str]]:
+    """(file on this machine, path in the container) for each hidden secret.
+    Split from the right, because a Windows path has a colon of its own."""
+    found = []
+    for mount in mounts(args):
+        source, target, mode = mount.rsplit(":", 2) if mount.endswith(":ro") else (None, None, None)
+        if target is not None and not target.endswith("/.git"):
+            found.append((Path(source), target))
+    return found
+
+
+def make_secrets(root: Path) -> None:
+    (root / ".env").write_text("GEMINI_API_KEY=real-looking\n", encoding="utf-8")
+    (root / "backend").mkdir()
+    (root / "backend" / ".env.local").write_text("DB_PASSWORD=x\n", encoding="utf-8")
+    (root / ".env.example").write_text("GEMINI_API_KEY=\n", encoding="utf-8")
+
+
+def test_the_git_history_is_mounted_read_only(tmp_path):
+    (tmp_path / ".git").mkdir()
+    docker = FakeDocker()
+
+    executor(tmp_path, docker).start()
+
+    assert f"{tmp_path / '.git'}:/workspace/.git:ro" in mounts(docker.last("run"))
+
+
+def test_a_project_without_secrets_or_git_mounts_only_the_folder(tmp_path):
+    docker = FakeDocker()
+
+    executor(tmp_path, docker).start()
+
+    assert mounts(docker.last("run")) == [f"{tmp_path}:/workspace"]
+
+
+def test_secret_files_are_covered_by_an_empty_read_only_file(tmp_path):
+    make_secrets(tmp_path)
+    docker = FakeDocker()
+    box = executor(tmp_path, docker)
+
+    box.start()
+
+    hidden = hidden_mounts(docker.last("run"))
+    # Every secrets file, but not the key-free template.
+    assert [target for _, target in hidden] == ["/workspace/.env", "/workspace/backend/.env.local"]
+    [empty] = {source for source, _ in hidden}
+    assert empty.exists()
+    assert empty.stat().st_size == 0
+    # The real files on this machine are untouched.
+    assert (tmp_path / ".env").read_text(encoding="utf-8") == "GEMINI_API_KEY=real-looking\n"
+
+    box.stop()
+
+    assert not empty.exists()
+
+
+def test_a_failed_start_leaves_no_empty_file_behind(tmp_path):
+    make_secrets(tmp_path)
+    docker = FakeDocker(start_result=(1, "Cannot connect to the Docker daemon.\n"))
+
+    with pytest.raises(SandboxError):
+        executor(tmp_path, docker).start()
+
+    [(empty, _), *_] = hidden_mounts(docker.last("run"))
+    assert not empty.exists()
+
+
+def test_a_replaced_container_hides_the_secrets_too(tmp_path):
+    make_secrets(tmp_path)
+    docker = FakeDocker(exec_times_out=True)
+    box = executor(tmp_path, docker)
+    box.start()
+    first = docker.last("run")
+
+    with pytest.raises(CommandTimedOut):
+        box.run("sleep 100", 5)
+
+    second = docker.last("run")
+    assert second is not first
+    assert [t for _, t in hidden_mounts(second)] == [t for _, t in hidden_mounts(first)]
+    assert not hidden_mounts(first)[0][0].exists()  # the old empty file is gone
+    assert hidden_mounts(second)[0][0].exists()
+    box.stop()
+
+
+def test_where_tells_the_model_about_git_and_env_files(tmp_path):
+    where = executor(tmp_path, FakeDocker()).where
+
+    assert "The .git folder is read-only, and .env files look empty" in where
 
 
 # --- When Docker cannot start it ---
@@ -275,8 +488,9 @@ class FakeSandbox:
     made: list["FakeSandbox"] = []
     fail_to_start = False
 
-    def __init__(self, root, image, user=None):
+    def __init__(self, root, image, user=None, network=False):
         self.image = image
+        self.network = network
         self.started = False
         self.stopped = False
         self.commands: list[str] = []
@@ -312,13 +526,40 @@ def test_sandbox_flag_runs_commands_in_the_container(fake_sandbox, capsys):
     assert exit_code == 0
     [box] = fake_sandbox.made
     assert box.image == DEFAULT_IMAGE
+    assert box.network is False
     assert box.commands == ["pytest"]
     assert (box.started, box.stopped) == (True, True)
     # The model is told where its commands run, and saw the box's output.
     history, system, _ = client.calls[-1]
     assert "Commands run inside a fake container." in system
     assert history[-1].tool_results[0].content == "exit code: 0\nran in the box"
-    assert "starting the sandbox container" in capsys.readouterr().err
+    assert (
+        f"starting the sandbox container ({DEFAULT_IMAGE}, no network)"
+        in capsys.readouterr().err
+    )
+
+
+def test_the_sandbox_network_flag_reaches_the_container(fake_sandbox, capsys):
+    main(["hi", "--sandbox", "--sandbox-network"], client=FakeClient(["Hi."]))
+
+    assert fake_sandbox.made[0].network is True
+    assert "with network)" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "flags", [["--sandbox-network"], ["--sandbox-image", "python:3.13-slim"]]
+)
+def test_sandbox_options_without_the_sandbox_are_refused(fake_sandbox, capsys, flags):
+    # Ignoring them would let someone believe commands are sandboxed.
+    client = FakeClient(["never used"])
+
+    with pytest.raises(SystemExit) as exit_info:
+        main(["hi", *flags], client=client)
+
+    assert exit_info.value.code == 2
+    assert "only work with --sandbox" in capsys.readouterr().err
+    assert fake_sandbox.made == []
+    assert client.calls == []
 
 
 def test_the_sandbox_image_can_be_chosen_on_the_command_line(fake_sandbox):
