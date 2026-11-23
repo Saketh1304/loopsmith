@@ -135,9 +135,11 @@ def print_sub_step_usage(step: int, usage: Usage) -> None:
 
 
 def print_retry(error: ModelError, delay: float, attempt: int) -> None:
+    # A network failure or a timeout never got an answer, so it has no
+    # HTTP status: say so instead of printing "HTTP None".
+    reason = "no response from the server" if error.status is None else f"HTTP {error.status}"
     print(
-        f"  .. model call failed (HTTP {error.status}); "
-        f"retrying in {delay:.0f}s (attempt {attempt})",
+        f"  .. model call failed ({reason}); retrying in {delay:.0f}s (attempt {attempt})",
         file=sys.stderr,
     )
 

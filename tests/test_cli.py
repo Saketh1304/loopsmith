@@ -2,7 +2,7 @@ import io
 
 import pytest
 
-from loopsmith.cli import ask_on_terminal, cached_note, main, system_prompt
+from loopsmith.cli import ask_on_terminal, cached_note, main, print_retry, system_prompt
 from loopsmith.config import API_KEY_VAR
 from loopsmith.llm import Message, ModelError, ModelReply, ToolCall, Usage
 from loopsmith.llm.fake import FakeClient
@@ -197,6 +197,21 @@ def test_token_usage_goes_to_stderr_not_stdout(monkeypatch, tmp_path, capsys):
     assert "step 2: 1,800 tokens in (1,200 cached), 40 out" in captured.err
     # 1,200 of 3,300 is 36%.
     assert "tokens: 3,300 in (1,200 cached, 36%), 60 out; last request 1,800" in captured.err
+
+
+def test_a_retry_after_an_http_error_shows_the_status(capsys):
+    print_retry(ModelError("busy", status=503, retryable=True), delay=2.4, attempt=1)
+
+    assert "model call failed (HTTP 503); retrying in 2s (attempt 1)" in capsys.readouterr().err
+
+
+def test_a_retry_after_a_timeout_does_not_print_http_none(capsys):
+    # A timeout or a lost connection has no HTTP status at all.
+    print_retry(ModelError("timed out", retryable=True), delay=4.0, attempt=2)
+
+    err = capsys.readouterr().err
+    assert "model call failed (no response from the server); retrying in 4s (attempt 2)" in err
+    assert "None" not in err
 
 
 def test_the_prompts_ask_for_independent_tool_calls_together():
