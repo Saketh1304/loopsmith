@@ -316,6 +316,20 @@ def test_a_budget_of_zero_turns_trimming_off():
     assert first_result_seen_by_last_call(client) == "x" * 6_000
 
 
+def test_a_big_new_result_is_counted_before_the_next_request_is_sent():
+    # The fourth request was 25,000 tokens, under the 30,000 budget, but it
+    # brought back about 20,000 tokens of output. Sending the fifth request
+    # as it stood would cost about 45,000. The old check only looked at the
+    # 25,000 and trimmed nothing; the estimate of the new output catches it.
+    huge = make_tool("huge", lambda args: "x" * 60_000)
+    huge_call = ModelReply("", (ToolCall("huge", {}),), usage=Usage(25_000, 10))
+    client = FakeClient([big_call(1_000), big_call(3_000), big_call(5_000), huge_call, "Done."])
+
+    Agent(client, tools=[big_tool(), huge], context_budget=30_000).run("Go")
+
+    assert first_result_seen_by_last_call(client).startswith("[Old output removed")
+
+
 def test_trim_observer_is_told_what_was_trimmed():
     seen = []
     client = FakeClient(
@@ -376,6 +390,28 @@ def test_old_history_is_summarised_when_trimming_is_not_enough():
     # The summary call is not a step of the task.
     assert result.text == "Done."
     assert result.steps == 6
+
+
+def test_the_summary_is_written_from_what_trimming_removed():
+    # One big result, then small ones. On the fifth step trimming replaces
+    # the big result with a note and then a summary is still needed. The
+    # summariser must see what the big result said, not the note.
+    client = FakeClient(
+        [
+            big_call(500),
+            *[small_call(600)] * 3,
+            small_call(5_000),
+            ModelReply("A summary."),
+            "Done.",
+        ]
+    )
+
+    Agent(client, tools=[big_tool(), small_tool()], context_budget=1_000).run("Fix the bug")
+
+    request = next(msgs for msgs, system, _ in client.calls if system == SUMMARY_SYSTEM_PROMPT)
+    text = request[0].text
+    assert "big result: " + "x" * 2_000 + " [... 4,000 more characters]" in text
+    assert "[Old output removed" not in text
 
 
 def test_the_summary_call_is_counted_in_the_token_total():

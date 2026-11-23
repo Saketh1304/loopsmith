@@ -18,6 +18,7 @@ from loopsmith.context import (
     SUMMARY_SYSTEM_PROMPT,
     SummaryReport,
     TrimReport,
+    estimate_history_tokens,
     split_history,
     summary_request,
     task_message,
@@ -132,7 +133,12 @@ class Agent:
             # the provider the history size is unknown, and it is left
             # alone.
             if reply.usage is not None and self._context_budget:
-                tokens = reply.usage.input_tokens
+                # The provider's count is for the request just sent. The
+                # next one also carries this reply and the results that just
+                # arrived, so their estimated size is added before deciding.
+                # Without it, one big file read slips a whole request past
+                # the budget before trimming notices (decision 61).
+                tokens = reply.usage.input_tokens + estimate_history_tokens(messages[-2:])
                 messages, tokens = self._trim_if_over_budget(messages, tokens)
                 if tokens > self._context_budget:
                     # Trimming was not enough. Summarising costs one more

@@ -1,7 +1,10 @@
+import json
+
 from loopsmith.context import (
     KEEP_RECENT_TOOL_TURNS,
     MIN_TRIM_CHARS,
     SUMMARY_RESULT_CHARS,
+    TrimmedResult,
     TrimReport,
     estimate_history_tokens,
     estimate_tokens,
@@ -14,6 +17,7 @@ from loopsmith.context import (
     worth_summarising,
 )
 from loopsmith.llm import Message, ToolCall, ToolResult
+from loopsmith.llm.gemini import build_request_body
 
 BIG = "x" * 6_000  # about 2,000 tokens
 
@@ -174,6 +178,23 @@ def test_the_cache_is_lost_from_the_first_trimmed_result_not_the_last():
 
     assert report.results_trimmed == 2
     assert report.uncached_tokens == estimate_history_tokens(trimmed[2:])
+
+
+def test_a_trimmed_result_keeps_the_removed_text_for_the_summariser_only():
+    messages = history(BIG, "b", "c", "d")
+
+    trimmed, _ = trim_history(messages, tokens_to_free=100)
+
+    result = trimmed[2].tool_results[0]
+    assert isinstance(result, TrimmedResult)
+    assert result.content.startswith("[Old output removed")
+    assert result.original == BIG
+    # The model is sent only the note...
+    assert BIG not in json.dumps(build_request_body(trimmed))
+    # ...and the summariser sees what the output said (cut to 2,000).
+    transcript = render_transcript(trimmed)
+    assert "read_file result: " + "x" * SUMMARY_RESULT_CHARS in transcript
+    assert "[Old output removed" not in transcript
 
 
 def test_the_trim_target_is_half_the_budget():

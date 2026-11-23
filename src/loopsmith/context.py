@@ -75,6 +75,20 @@ class TrimReport:
     uncached_tokens: int = 0
 
 
+@dataclass(frozen=True)
+class TrimmedResult(ToolResult):
+    """A tool result whose text was replaced with a note.
+
+    It is still a ToolResult, so everything else treats it as one, and
+    only `content` (the note) is ever sent to the model. `original` keeps
+    the text that was removed, for the summariser alone: a summary should
+    say what was learned from the output, not just that a tool ran
+    (decision 62). In Java this would be a subclass adding one field.
+    """
+
+    original: str = ""
+
+
 def estimate_tokens(text: str) -> int:
     return len(text) // CHARS_PER_TOKEN
 
@@ -123,10 +137,16 @@ def trim_history(
                 count += 1
                 if first_changed is None:
                     first_changed = position
-                # `replace` copies a frozen dataclass with one field
-                # changed, like a "wither" method on a Java record.
-                result = replace(result, content=note)
+                result = TrimmedResult(
+                    name=result.name,
+                    content=note,
+                    is_error=result.is_error,
+                    id=result.id,
+                    original=result.content,
+                )
             results.append(result)
+        # `replace` copies a frozen dataclass with one field changed, like
+        # a "wither" method on a Java record.
         trimmed[position] = replace(messages[position], tool_results=tuple(results))
 
     uncached = 0 if first_changed is None else estimate_history_tokens(trimmed[first_changed:])
@@ -203,7 +223,11 @@ def render_transcript(messages: list[Message]) -> str:
             lines.append(f"assistant called {call.name} with {call.args}")
         for result in message.tool_results:
             kind = "error" if result.is_error else "result"
-            lines.append(f"{result.name} {kind}: {_shorten(result.content)}")
+            # A trimmed result is shown as it was before trimming, still cut
+            # to SUMMARY_RESULT_CHARS: the summary has to say what the
+            # output told the agent, not that it was removed.
+            text = result.original if isinstance(result, TrimmedResult) else result.content
+            lines.append(f"{result.name} {kind}: {_shorten(text)}")
     return "\n".join(lines)
 
 
