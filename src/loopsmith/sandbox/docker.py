@@ -166,7 +166,10 @@ class DockerExecutor:
         if secrets:
             handle, name = tempfile.mkstemp(prefix="loopsmith-hidden-")
             os.close(handle)
-            self._empty_file = Path(name)
+            # The full spelling of the path, never a Windows short form such
+            # as RUNNER~1, which Docker may not understand as a mount source
+            # (decision 70).
+            self._empty_file = Path(name).resolve()
             for path in secrets:
                 inside = path.relative_to(self._root).as_posix()
                 args += ["--volume", f"{self._empty_file}:{CONTAINER_WORKDIR}/{inside}:ro"]

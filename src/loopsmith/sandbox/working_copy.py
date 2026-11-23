@@ -75,7 +75,12 @@ class WorkingCopy:
         project's .git is mounted into the container separately, read-only.
         """
         project = project.resolve()
-        root = Path(tempfile.mkdtemp(prefix="loopsmith-copy-"))
+        # resolve() gives the one full spelling of the folder. Windows can
+        # hand out the temporary folder in a short form such as
+        # C:\Users\RUNNER~1\..., while code that resolves the path sees
+        # C:\Users\runneradmin\...: two spellings of one folder, which CI
+        # caught (decision 70).
+        root = Path(tempfile.mkdtemp(prefix="loopsmith-copy-")).resolve()
         fingerprints = {}
         for relative, source in _files(project):
             if is_secrets_file(source):

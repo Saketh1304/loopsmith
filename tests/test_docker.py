@@ -8,6 +8,7 @@ tested in test_docker_live.py, which only runs when asked to.
 import os
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -341,6 +342,32 @@ def test_secret_files_are_covered_by_an_empty_read_only_file(tmp_path):
     box.stop()
 
     assert not empty.exists()
+
+
+def test_the_hidden_file_path_has_one_spelling(tmp_path, monkeypatch):
+    # A Windows short name such as RUNNER~1 may not work as a Docker mount
+    # source. "x/.." stands in for such a second spelling of one folder.
+    real_mkstemp = tempfile.mkstemp
+    temp = tmp_path / "temp"
+    (temp / "x").mkdir(parents=True)
+
+    def roundabout_mkstemp(prefix=""):
+        handle, name = real_mkstemp(prefix=prefix, dir=temp)
+        return handle, str(temp / "x" / ".." / Path(name).name)
+
+    monkeypatch.setattr(tempfile, "mkstemp", roundabout_mkstemp)
+    project = tmp_path / "project"
+    project.mkdir()
+    make_secrets(project)
+    docker = FakeDocker()
+    box = executor(project, docker)
+
+    box.start()
+
+    [(source, _), *_] = hidden_mounts(docker.last("run"))
+    assert ".." not in source.parts
+    assert source == source.resolve()
+    box.stop()
 
 
 def test_a_failed_start_leaves_no_empty_file_behind(tmp_path):

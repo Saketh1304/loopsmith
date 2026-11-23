@@ -5,6 +5,8 @@ Windows and Linux (decision 29).
 """
 
 import os
+import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -15,6 +17,7 @@ from loopsmith.sandbox.working_copy import (
     Changes,
     WorkingCopy,
 )
+from loopsmith.tools import Workspace
 
 
 @pytest.fixture
@@ -64,6 +67,27 @@ def test_the_copy_has_the_project_files_but_not_secrets_or_tool_folders(copy, pr
     assert copy.file_count == 4
     assert copy.root != project
     assert copy.project == project.resolve()
+
+
+def test_the_copy_folder_has_one_spelling(project, tmp_path, monkeypatch):
+    # Windows can name the temporary folder two ways (RUNNER~1 and
+    # runneradmin on GitHub's machines), which once failed CI. A path with
+    # "x/.." in it is another spelling of one folder, and works anywhere.
+    real_mkdtemp = tempfile.mkdtemp
+    (tmp_path / "x").mkdir()
+
+    def roundabout_mkdtemp(prefix=""):
+        made = Path(real_mkdtemp(prefix=prefix, dir=tmp_path))
+        return str(tmp_path / "x" / ".." / made.name)
+
+    monkeypatch.setattr(tempfile, "mkdtemp", roundabout_mkdtemp)
+    working_copy = WorkingCopy.create(project)
+    try:
+        assert ".." not in working_copy.root.parts
+        # The path loopsmith prints is the one the file tools work in.
+        assert Workspace(working_copy.root).root == working_copy.root
+    finally:
+        working_copy.remove()
 
 
 def test_symbolic_links_are_not_copied(project, tmp_path):
