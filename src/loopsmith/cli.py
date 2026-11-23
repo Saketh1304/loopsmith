@@ -29,6 +29,12 @@ def system_prompt() -> str:
         "folder. All paths are relative to that folder.\n"
         "- Look before you act: list and read files instead of guessing what "
         "they contain.\n"
+        "- When you need several things that do not depend on each other, "
+        "such as three files to read, ask for them together: several tool "
+        "calls in one reply. Every reply is a separate request, so this "
+        "saves time and quota.\n"
+        "- For a long file, read only the lines you need with start_line and "
+        "end_line.\n"
         "- Read a file before editing it. Use edit_file for small changes and "
         "write_file for new files.\n"
         "- After changing code, run the project's tests if it has any.\n"
@@ -112,6 +118,14 @@ def cached_note(usage: Usage) -> str:
     return f" ({usage.cached_tokens:,} cached)" if usage.cached_tokens else ""
 
 
+def print_sub_trim(report: TrimReport) -> None:
+    print_trim(report, indent=SUB_INDENT)
+
+
+def print_sub_summary(report: SummaryReport) -> None:
+    print_summary(report, indent=SUB_INDENT)
+
+
 def print_sub_step_usage(step: int, usage: Usage) -> None:
     print(
         f"{SUB_INDENT}.. sub-agent step {step}: {usage.input_tokens:,} tokens in"
@@ -138,23 +152,24 @@ def print_step_usage(step: int, usage: Usage) -> None:
     )
 
 
-def print_trim(report: TrimReport) -> None:
+def print_trim(report: TrimReport, indent: str = "  ") -> None:
     """Show what a trim saved, and what it costs: the cache only covers a
     request up to its first change, so everything after the first trimmed
     result is sent once more without the cache's discount."""
     noun = "result" if report.results_trimmed == 1 else "results"
     print(
-        f"  .. trimmed {report.results_trimmed} old tool {noun}, "
+        f"{indent}.. trimmed {report.results_trimmed} old tool {noun}, "
         f"about {report.tokens_freed:,} tokens; the next request re-reads "
         f"about {report.uncached_tokens:,} tokens without the cache",
         file=sys.stderr,
     )
 
 
-def print_summary(report: SummaryReport) -> None:
+def print_summary(report: SummaryReport, indent: str = "  ") -> None:
     if report.error is not None:
         print(
-            f"  .. could not summarise the history ({report.error}); carrying on without",
+            f"{indent}.. could not summarise the history ({report.error}); "
+            "carrying on without",
             file=sys.stderr,
         )
         return
@@ -167,7 +182,7 @@ def print_summary(report: SummaryReport) -> None:
     # The summary goes into the first message, so the whole history after
     # the system prompt and tools changes, and none of it is cached.
     print(
-        f"  .. summarised {report.messages_replaced} old messages{cost}; "
+        f"{indent}.. summarised {report.messages_replaced} old messages{cost}; "
         "the next request re-reads the whole history without the cache",
         file=sys.stderr,
     )
@@ -256,6 +271,8 @@ def main(
             context_budget=args.context_budget,
             on_tool=print_sub_tool_call,
             on_usage=print_sub_step_usage,
+            on_trim=print_sub_trim,
+            on_summary=print_sub_summary,
         )
         agent = Agent(
             client,

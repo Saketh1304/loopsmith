@@ -85,6 +85,102 @@ def test_read_file_truncates_large_files(workspace):
     assert "500 more characters" in result
 
 
+# --- Reading part of a file ---
+
+
+@pytest.fixture
+def ten_lines(workspace):
+    text = "".join(f"line {n}\n" for n in range(1, 11))
+    (workspace.root / "ten.txt").write_bytes(text.encode("utf-8"))
+    return read_file_tool(workspace)
+
+
+def test_read_file_can_read_a_range_of_lines(ten_lines):
+    result = ten_lines.run({"path": "ten.txt", "start_line": 3, "end_line": 5})
+
+    assert result == "[ten.txt: lines 3 to 5 of 10]\nline 3\nline 4\nline 5\n"
+
+
+def test_read_file_with_only_start_line_reads_to_the_end(ten_lines):
+    result = ten_lines.run({"path": "ten.txt", "start_line": 9})
+
+    assert result == "[ten.txt: lines 9 to 10 of 10]\nline 9\nline 10\n"
+
+
+def test_read_file_with_only_end_line_reads_from_the_top(ten_lines):
+    result = ten_lines.run({"path": "ten.txt", "end_line": 2})
+
+    assert result == "[ten.txt: lines 1 to 2 of 10]\nline 1\nline 2\n"
+
+
+def test_read_file_stops_at_the_last_line_when_end_line_is_past_it(ten_lines):
+    result = ten_lines.run({"path": "ten.txt", "start_line": 10, "end_line": 500})
+
+    assert result == "[ten.txt: lines 10 to 10 of 10]\nline 10\n"
+
+
+def test_read_file_accepts_a_whole_number_sent_as_a_float(ten_lines):
+    # JSON has one kind of number, so 4 may arrive as 4.0.
+    result = ten_lines.run({"path": "ten.txt", "start_line": 4.0, "end_line": 4.0})
+
+    assert result == "[ten.txt: lines 4 to 4 of 10]\nline 4\n"
+
+
+def test_read_file_range_of_a_windows_file_has_plain_line_endings(workspace):
+    (workspace.root / "win.txt").write_bytes(b"one\r\ntwo\r\nthree\r\n")
+
+    result = read_file_tool(workspace).run({"path": "win.txt", "start_line": 2, "end_line": 2})
+
+    assert result == "[win.txt: lines 2 to 2 of 3]\ntwo\n"
+
+
+@pytest.mark.parametrize(
+    ("args", "message"),
+    [
+        ({"start_line": 11}, "has 10 lines, so start_line 11 is past its end"),
+        ({"start_line": 5, "end_line": 4}, r"end_line \(4\) is before start_line \(5\)"),
+        ({"start_line": 0}, "must be 1 or more"),
+        ({"start_line": "3"}, "must be a whole number"),
+        ({"start_line": 2.5}, "must be a whole number"),
+        ({"end_line": True}, "must be a whole number"),
+    ],
+)
+def test_read_file_explains_a_bad_line_range(ten_lines, args, message):
+    with pytest.raises(ToolError, match=message):
+        ten_lines.run({"path": "ten.txt", **args})
+
+
+def test_read_file_still_refuses_secrets_when_a_range_is_given(workspace):
+    with pytest.raises(ToolError, match="secrets"):
+        read_file_tool(workspace).run({"path": ".env", "start_line": 1, "end_line": 1})
+
+
+def test_a_truncated_file_says_which_line_to_read_on_from(workspace):
+    # 1,000 lines of 50 characters: the cut at 40,000 characters comes
+    # right after line 800, so the note points to line 801, and reading on
+    # from there works.
+    text = "".join(f"{n:05d}" + "b" * 44 + "\n" for n in range(1, 1_001))
+    (workspace.root / "long.txt").write_bytes(text.encode("utf-8"))
+    tool = read_file_tool(workspace)
+
+    first = tool.run({"path": "long.txt"})
+
+    assert first.endswith("Read on with start_line=801.]")
+    rest = tool.run({"path": "long.txt", "start_line": 801})
+    assert rest.startswith("[long.txt: lines 801 to 1000 of 1000]\n00801")
+
+
+def test_a_cut_range_counts_lines_from_where_the_range_starts(workspace):
+    text = "".join(f"{n:05d}" + "b" * 44 + "\n" for n in range(1, 2_001))
+    (workspace.root / "long.txt").write_bytes(text.encode("utf-8"))
+
+    result = read_file_tool(workspace).run({"path": "long.txt", "start_line": 1_001})
+
+    # 800 lines of the range fit (lines 1,001 to 1,800), so the note
+    # points to line 1,801, not to the range's own 801st line.
+    assert result.endswith("Read on with start_line=1801.]")
+
+
 def test_list_files_shows_root_and_marks_folders(workspace):
     listing = list_files_tool(workspace).run({}).splitlines()
 

@@ -6,6 +6,7 @@ from loopsmith.cli import ask_on_terminal, cached_note, main, system_prompt
 from loopsmith.config import API_KEY_VAR
 from loopsmith.llm import Message, ModelError, ModelReply, ToolCall, Usage
 from loopsmith.llm.fake import FakeClient
+from loopsmith.subagent import SUB_AGENT_SYSTEM_PROMPT
 
 
 class FailingClient:
@@ -198,6 +199,15 @@ def test_token_usage_goes_to_stderr_not_stdout(monkeypatch, tmp_path, capsys):
     assert "tokens: 3,300 in (1,200 cached, 36%), 60 out; last request 1,800" in captured.err
 
 
+def test_the_prompts_ask_for_independent_tool_calls_together():
+    # Each reply is one request, and requests are the scarce resource.
+    assert "several tool calls in one reply" in system_prompt()
+    assert "several tool calls in one reply" in SUB_AGENT_SYSTEM_PROMPT
+    # Both also point to reading part of a long file.
+    assert "start_line and end_line" in system_prompt()
+    assert "start_line and end_line" in SUB_AGENT_SYSTEM_PROMPT
+
+
 def test_the_cached_count_is_shown_only_when_something_was_cached():
     assert cached_note(Usage(1_000, 10)) == ""
     assert cached_note(Usage(9_000, 10, cached_tokens=5_120)) == " (5,120 cached)"
@@ -219,6 +229,27 @@ def test_a_sub_agent_step_shows_its_cached_tokens(monkeypatch, tmp_path, capsys)
     assert "      .. sub-agent step 1: 900 tokens in (600 cached), 20 out" in (
         capsys.readouterr().err
     )
+
+
+def test_a_sub_agent_trim_is_shown_indented(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "big.txt").write_text("x" * 6_000, encoding="utf-8")
+    ask = ToolCall("delegate", {"task": "What is in big.txt?"})
+    client = FakeClient(
+        [
+            ModelReply("", (ask,), usage=Usage(1_000, 10)),
+            *[read_big_file(n) for n in (1_000, 3_000, 5_000, 50_000)],
+            "Only x.",
+            "It is all x.",
+        ]
+    )
+
+    main(["what is in big.txt"], client=client)
+
+    err = capsys.readouterr().err
+    # Indented like the sub-agent's other lines, not like the main agent's.
+    assert "      .. trimmed 1 old tool result, about" in err
+    assert "\n  .. trimmed" not in err
 
 
 def test_no_usage_line_when_the_model_reports_no_counts(monkeypatch, tmp_path, capsys):

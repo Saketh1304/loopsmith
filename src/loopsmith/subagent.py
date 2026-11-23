@@ -9,7 +9,13 @@ To the main agent this is an ordinary tool called `delegate`. The agent
 loop does not know that sub-agents exist.
 """
 
-from loopsmith.agent import Agent, ToolObserver, UsageObserver
+from loopsmith.agent import (
+    Agent,
+    SummaryObserver,
+    ToolObserver,
+    TrimObserver,
+    UsageObserver,
+)
 from loopsmith.context import DEFAULT_CONTEXT_BUDGET
 from loopsmith.llm.base import ModelClient, ModelError, Usage
 from loopsmith.tools.base import Tool, ToolError, require_string
@@ -25,6 +31,10 @@ SUB_AGENT_SYSTEM_PROMPT = (
     "- You can list and read files. You cannot change files or run "
     "commands, so do not try.\n"
     "- Look instead of guessing: read the files that matter.\n"
+    "- When you already know several files you need, ask for them together: "
+    "several tool calls in one reply. Every reply is a separate request.\n"
+    "- For a long file, read only the lines you need with start_line and "
+    "end_line.\n"
     "- Your final reply is the only thing the other agent will see. It does "
     "not see the files you read. Give the answer with the evidence: file "
     "paths, function names, and short quotes of the lines that matter.\n"
@@ -58,6 +68,8 @@ class SubAgents:
         context_budget: int | None = DEFAULT_CONTEXT_BUDGET,
         on_tool: ToolObserver | None = None,
         on_usage: UsageObserver | None = None,
+        on_trim: TrimObserver | None = None,
+        on_summary: SummaryObserver | None = None,
     ):
         # A sub-agent has nobody to ask for approval, so it is only ever
         # given tools that change nothing. This is checked here, once,
@@ -73,6 +85,10 @@ class SubAgents:
         self._context_budget = context_budget
         self._on_tool = on_tool
         self._on_usage = on_usage
+        # A sub-agent trims and summarises its own history just like the
+        # main agent. These let the user see it happen.
+        self._on_trim = on_trim
+        self._on_summary = on_summary
         self.usage = Usage()  # total over every sub-agent run
         self.runs = 0
 
@@ -93,6 +109,8 @@ class SubAgents:
             on_tool=self._on_tool,
             on_usage=self._on_usage,
             context_budget=self._context_budget,
+            on_trim=self._on_trim,
+            on_summary=self._on_summary,
         )
         self.runs += 1
         try:

@@ -221,6 +221,36 @@ def test_tool_results_are_sent_as_function_responses_in_a_user_turn():
     ]
 
 
+def test_several_function_calls_in_one_reply_make_the_round_trip_together():
+    # Asking for independent tools together saves requests. Gemini puts the
+    # thought signature on the first call only; all calls go back as they
+    # came, and all results go back in one user turn, in the same order.
+    parts = [
+        {
+            "functionCall": {"name": "read_file", "args": {"path": "a.py"}},
+            "thoughtSignature": "sig-1",
+        },
+        {"functionCall": {"name": "read_file", "args": {"path": "b.py"}}},
+    ]
+    reply = parse_reply({"candidates": [{"content": {"parts": parts}}]})
+    assert [call.args["path"] for call in reply.tool_calls] == ["a.py", "b.py"]
+
+    results = tuple(
+        ToolResult("read_file", f"contents of {call.args['path']}") for call in reply.tool_calls
+    )
+    history = [
+        Message("user", "read both"),
+        reply.as_message(),
+        Message("tool", tool_results=results),
+    ]
+    body = build_request_body(history)
+
+    assert len(body["contents"]) == 3
+    assert body["contents"][1] == {"role": "model", "parts": parts}
+    sent = [part["functionResponse"]["response"]["result"] for part in body["contents"][2]["parts"]]
+    assert sent == ["contents of a.py", "contents of b.py"]
+
+
 def test_assistant_tool_calls_without_raw_parts_are_rebuilt():
     message = Message("assistant", "Let me look.", (ToolCall("read_file", {"path": "a"}),))
 

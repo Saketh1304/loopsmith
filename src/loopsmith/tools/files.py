@@ -94,9 +94,57 @@ def _diff(old: str, new: str, name: str) -> str:
 # --- Read-only tools ---
 
 
+def _optional_line(args: dict, name: str) -> int | None:
+    """Read an optional line number (counted from 1), or raise a ToolError."""
+    value = args.get(name)
+    if value is None:
+        return None
+    # JSON has only one kind of number, so a whole number can arrive as
+    # 40.0. In Python, True and False are also ints, so bool is refused
+    # by name.
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ToolError(f"Argument '{name}' must be a whole number.")
+    if value < 1:
+        raise ToolError(f"Argument '{name}' must be 1 or more: lines are counted from 1.")
+    return value
+
+
+def _capped(text: str, first_line: int = 1) -> str:
+    """Cut text that is too long to send, and say where to read on from."""
+    if len(text) <= MAX_FILE_CHARS:
+        return text
+    shown = text[:MAX_FILE_CHARS]
+    omitted = len(text) - MAX_FILE_CHARS
+    # The line the cut fell in. Reading on from it repeats part of that
+    # line, which is safer than skipping the rest of it.
+    next_line = first_line + shown.count("\n")
+    return (
+        f"{shown}\n[... truncated, {omitted:,} more characters. "
+        f"Read on with start_line={next_line}.]"
+    )
+
+
+def _line_range(text: str, start: int, end: int | None, name: str) -> str:
+    """Lines `start` to `end` of the text, both included, under a header
+    that says where they are, so the model knows how much it has not seen."""
+    lines = text.splitlines(keepends=True)
+    total = len(lines)
+    if start > total:
+        raise ToolError(f"'{name}' has {total} lines, so start_line {start} is past its end.")
+    if end is not None and end < start:
+        raise ToolError(f"end_line ({end}) is before start_line ({start}).")
+    end = total if end is None else min(end, total)
+    header = f"[{name}: lines {start} to {end} of {total}]\n"
+    return header + _capped("".join(lines[start - 1 : end]), first_line=start)
+
+
 def read_file_tool(workspace: Workspace) -> Tool:
     def run(args: dict) -> str:
         path = workspace.resolve(require_string(args, "path"))
+        start = _optional_line(args, "start_line")
+        end = _optional_line(args, "end_line")
         if is_secrets_file(path):
             # File contents are sent to the model provider. Keys must not be.
             raise ToolError(f"'{path.name}' holds secrets and cannot be read.")
@@ -108,21 +156,35 @@ def read_file_tool(workspace: Workspace) -> Tool:
             text = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             raise ToolError(f"'{workspace.display(path)}' is not a text file.") from None
-        if len(text) > MAX_FILE_CHARS:
-            omitted = len(text) - MAX_FILE_CHARS
-            return f"{text[:MAX_FILE_CHARS]}\n[... truncated, {omitted} more characters]"
-        return text
+        if start is None and end is None:
+            return _capped(text)
+        # Reading part of a file keeps a large file from filling the
+        # history, where it would be sent again on every later step.
+        return _line_range(text, start or 1, end, workspace.display(path))
 
     return Tool(
         name="read_file",
-        description="Read a text file in the project and return its contents.",
+        description=(
+            "Read a text file in the project. Returns the whole file, or only "
+            "the lines from start_line to end_line when they are given. Lines "
+            "are counted from 1. For a long file, read just the part you need."
+        ),
         parameters={
             "type": "object",
             "properties": {
                 "path": {
                     "type": "string",
                     "description": "File path relative to the project folder.",
-                }
+                },
+                "start_line": {
+                    "type": "integer",
+                    "description": "First line to read, counting from 1. "
+                    "Leave out to start at the top.",
+                },
+                "end_line": {
+                    "type": "integer",
+                    "description": "Last line to read, included. Leave out to read to the end.",
+                },
             },
             "required": ["path"],
         },

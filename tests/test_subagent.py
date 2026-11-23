@@ -196,6 +196,52 @@ def test_observers_see_what_the_sub_agent_does():
     assert steps == [(1, 400), (2, 2_100)]
 
 
+def look_call(input_tokens: int) -> ModelReply:
+    return ModelReply("", (ToolCall("look", {}),), usage=Usage(input_tokens, 5))
+
+
+def test_the_sub_agent_reports_its_own_trims():
+    # Four tool turns in the sub-agent; its fourth request is over the
+    # budget, so the oldest 5,000-character result is trimmed.
+    trims = []
+    client = FakeClient(
+        [delegate("Q"), *[look_call(n) for n in (100, 200, 300, 50_000)], "Found it.", "Done."]
+    )
+    subagents = SubAgents(client, [look_tool()], context_budget=30_000, on_trim=trims.append)
+
+    run_main(client, subagents)
+
+    assert len(trims) == 1
+    assert trims[0].results_trimmed == 1
+
+
+def small_look_tool() -> Tool:
+    """Results under 1,000 characters, too small to trim."""
+    return Tool("look", "look tool", {"type": "object"}, run=lambda args: "y" * 900)
+
+
+def test_the_sub_agent_reports_its_own_summaries():
+    summaries = []
+    client = FakeClient(
+        [
+            delegate("Q"),
+            *[look_call(500)] * 4,
+            look_call(5_000),
+            ModelReply("Summary of the reading.", usage=Usage(700, 40)),
+            "Found it.",
+            "Done.",
+        ]
+    )
+    subagents = SubAgents(
+        client, [small_look_tool()], context_budget=1_000, on_summary=summaries.append
+    )
+
+    run_main(client, subagents)
+
+    assert [report.messages_replaced for report in summaries] == [4]
+    assert delegate_result(client).content == "Found it."
+
+
 def test_the_research_tools_only_look(tmp_path):
     tools = research_tools(Workspace(tmp_path))
 
