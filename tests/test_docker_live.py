@@ -14,11 +14,15 @@ import subprocess
 
 import pytest
 
+from loopsmith.cli import main
 from loopsmith.config import API_KEY_VAR
+from loopsmith.llm import ToolCall
+from loopsmith.llm.fake import FakeClient
 from loopsmith.sandbox import (
     IMAGE_DESCRIPTION,
     CommandTimedOut,
     DockerExecutor,
+    WorkingCopy,
     current_user,
     ensure_image,
 )
@@ -153,6 +157,74 @@ def test_git_reads_the_history_but_cannot_change_it(tmp_path, sandbox_image):
     assert status.exit_code == 0
     assert commit.exit_code != 0
     assert "Read-only file system" in commit.output
+
+
+# --- Working on a copy (decision 68) ---
+
+
+def test_a_command_can_only_damage_the_copy(tmp_path, sandbox_image):
+    project = tmp_path / "project"
+    (project / "sub").mkdir(parents=True)
+    (project / "untracked.txt").write_bytes(b"not in git, nowhere else\n")
+    (project / "sub" / "code.py").write_bytes(b"x = 1\n")
+    copy = WorkingCopy.create(project)
+    try:
+        with open_box(copy.root, sandbox_image, git_dir=project / ".git") as box:
+            box.run("rm -rf /workspace/* && echo wiped", 60)
+
+        # The project is untouched, untracked file included...
+        assert (project / "untracked.txt").read_bytes() == b"not in git, nowhere else\n"
+        assert (project / "sub" / "code.py").read_bytes() == b"x = 1\n"
+        # ...and the damage shows up as changes to review, not applied ones.
+        assert copy.changes().deleted == ("sub/code.py", "untracked.txt")
+    finally:
+        copy.remove()
+
+
+def test_the_whole_flow_through_the_cli(tmp_path, monkeypatch, sandbox_image):
+    # A scripted model asks for one command; the real container runs it on
+    # the copy; the fix reaches the project only once the review is approved.
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "stats.py").write_bytes(b"buggy\n")
+    fix = ToolCall("run_command", {"command": "printf 'fixed\\n' > stats.py"})
+    reviews = []
+
+    def approve_review(review: str) -> bool:
+        reviews.append(review)
+        assert (tmp_path / "stats.py").read_bytes() == b"buggy\n"  # not yet applied
+        return True
+
+    exit_code = main(
+        ["fix stats.py", "--sandbox", "--yes"],
+        client=FakeClient([fix, "Fixed."]),
+        confirm_apply=approve_review,
+    )
+
+    assert exit_code == 0
+    assert "+fixed" in reviews[0]
+    assert (tmp_path / "stats.py").read_bytes() == b"fixed\n"
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git on this machine")
+def test_git_in_the_box_compares_the_copy_with_the_real_history(tmp_path, sandbox_image):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "x.txt").write_bytes(b"one\n")
+    identity = ["-c", "user.name=Test", "-c", "user.email=test@example.com"]
+    subprocess.run(["git", "-C", str(project), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(project), "add", "x.txt"], check=True)
+    subprocess.run(["git", "-C", str(project), *identity, "commit", "-q", "-m", "first"], check=True)
+    copy = WorkingCopy.create(project)
+    try:
+        with open_box(copy.root, sandbox_image, git_dir=project / ".git") as box:
+            status = box.run("echo two >> x.txt && git status --short", 60)
+
+        assert status.exit_code == 0
+        assert status.output.split() == ["M", "x.txt"]  # the copy, against the real history
+        assert (project / "x.txt").read_bytes() == b"one\n"  # the project is unchanged
+        assert copy.changes().modified == ("x.txt",)
+    finally:
+        copy.remove()
 
 
 # --- The project's history and secrets ---

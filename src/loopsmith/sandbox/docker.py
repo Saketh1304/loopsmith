@@ -111,8 +111,13 @@ class DockerExecutor:
         user: str | None = None,
         network: bool = False,
         image_description: str | None = None,
+        git_dir: Path | None = None,
     ):
         self._root = root
+        # The git history to show inside, read-only. It is the project's own
+        # .git even when `root` is a working copy that has none (decision 68),
+        # so `git status` inside compares the copy with the real history.
+        self._git_dir = git_dir if git_dir is not None else root / ".git"
         # Which image to run is the caller's choice; making sure it exists
         # is too (see image.py). This class only runs containers.
         self._image = image
@@ -151,7 +156,7 @@ class DockerExecutor:
         the container they replace what the folder has at those paths.
         """
         args = ["--volume", f"{self._root}:{CONTAINER_WORKDIR}"]
-        git = self._root / ".git"
+        git = self._git_dir
         if git.exists():
             # Commands can still read the history (git log, git diff) but not
             # change or delete it, so the user can always get files back.

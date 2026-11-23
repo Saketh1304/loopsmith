@@ -10,6 +10,7 @@ Usage:
 import argparse
 import sys
 from pathlib import Path
+from typing import Callable
 
 from loopsmith import __version__
 from loopsmith.agent import DEFAULT_MAX_STEPS, Agent, AgentResult, Approver
@@ -24,6 +25,7 @@ from loopsmith.sandbox import (
     Executor,
     LocalExecutor,
     SandboxError,
+    WorkingCopy,
     current_user,
     ensure_image,
 )
@@ -266,9 +268,13 @@ def print_image_build(tag: str) -> None:
     )
 
 
-def make_executor(args: argparse.Namespace, root: Path) -> Executor:
+def make_executor(args: argparse.Namespace, root: Path, git_dir: Path) -> Executor:
     """Where run_command's commands run: this machine, or with --sandbox a
-    Docker container, started here. Raises SandboxError if it cannot start."""
+    Docker container, started here. Raises SandboxError if it cannot start.
+
+    `root` is the folder commands work in: the project, or with --sandbox
+    its working copy. `git_dir` is the project's own history.
+    """
     if not args.sandbox:
         return LocalExecutor(root)
     if args.sandbox_image:
@@ -285,9 +291,78 @@ def make_executor(args: argparse.Namespace, root: Path) -> Executor:
         user=current_user(),
         network=args.sandbox_network,
         image_description=description,
+        git_dir=git_dir,
     )
     executor.start()
     return executor
+
+
+# --- Working on a copy (decisions 68 and 69) ---
+
+# Shown the review of the changes; returns True to copy them back into the
+# project.
+ApplyConfirmer = Callable[[str], bool]
+
+
+def make_copy(project: Path) -> WorkingCopy:
+    copy = WorkingCopy.create(project)
+    print(
+        f"  .. working on a copy of the project ({copy.file_count:,} files) in {copy.root}; "
+        "your files change only if you apply the result",
+        file=sys.stderr,
+    )
+    return copy
+
+
+def ask_to_apply(review: str) -> bool:
+    """Show what changed and ask whether to copy it back into the project.
+
+    Like approving a single action, this fails closed: with no terminal to
+    ask on, nothing is applied.
+    """
+    print(f"\n{review}", file=sys.stderr)
+    if not sys.stdin.isatty():
+        print("Not applied: no terminal to ask on.", file=sys.stderr)
+        return False
+    print("Apply these changes to your project? [y/N] ", end="", file=sys.stderr, flush=True)
+    return sys.stdin.readline().strip().lower() in ("y", "yes")
+
+
+def finish_copy(copy: WorkingCopy, confirm: ApplyConfirmer | None) -> None:
+    """Review the copy's changes and apply them if the user agrees.
+
+    `confirm` is None when the run stopped early (an error or Ctrl+C): then
+    nothing is applied, but nothing is lost either. Whenever changes are
+    left unapplied, the copy is kept and its path printed.
+    """
+    changes = copy.changes()
+    if changes.count == 0:
+        print("  .. no changes to apply", file=sys.stderr)
+        copy.remove()
+        return
+    if confirm is None:
+        print(
+            f"  .. the run stopped early, so nothing was applied. The changes so far "
+            f"are in {copy.root}",
+            file=sys.stderr,
+        )
+        return
+    if not confirm(copy.review(changes)):
+        print(f"  .. not applied. The changes are kept in {copy.root}", file=sys.stderr)
+        return
+    report = copy.apply(changes)
+    print(
+        f"  .. applied {len(report.applied)} of {changes.count} changes to {copy.project}",
+        file=sys.stderr,
+    )
+    if report.conflicts:
+        print(
+            "  .. not applied, because you changed them during the run: "
+            f"{', '.join(report.conflicts)}. The agent's versions are in {copy.root}",
+            file=sys.stderr,
+        )
+        return
+    copy.remove()
 
 
 def approve_everything(call: ToolCall, preview: str) -> bool:
@@ -311,12 +386,13 @@ def main(
     argv: list[str] | None = None,
     client: ModelClient | None = None,
     approve: Approver | None = None,
+    confirm_apply: ApplyConfirmer | None = None,
 ) -> int:
     """Run the CLI. Returns the process exit code (0 means success).
 
-    `client` and `approve` exist so tests can pass in a fake model and a
-    scripted approver. In normal use both are None: a real GeminiClient is
-    created, and the user is asked on the terminal.
+    `client`, `approve` and `confirm_apply` exist so tests can pass in a
+    fake model and scripted answers. In normal use all are None: a real
+    GeminiClient is created, and the user is asked on the terminal.
     """
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -343,38 +419,49 @@ def main(
         if approve is None:
             approve = approve_everything if args.yes else ask_on_terminal
 
-        workspace = Workspace(Path.cwd())
-        # Started before the first model call, so a Docker problem costs no
-        # requests. Stopped in `finally`, whatever happens during the run.
-        executor = make_executor(args, workspace.root)
+        project = Path.cwd()
+        # With --sandbox the agent works on a copy, and the project changes
+        # only if the user applies the result at the end (decision 68).
+        copy = make_copy(project) if args.sandbox else None
+        finished = False
         try:
-            subagents = SubAgents(
-                client,
-                research_tools(workspace),
-                context_budget=args.context_budget,
-                on_tool=print_sub_tool_call,
-                on_usage=print_sub_step_usage,
-                on_trim=print_sub_trim,
-                on_summary=print_sub_summary,
-            )
-            agent = Agent(
-                client,
-                tools=[*default_tools(workspace, executor), subagents.tool()],
-                system=system_prompt(executor),
-                max_steps=args.max_steps,
-                on_tool=print_tool_call,
-                approve=approve,
-                on_usage=print_step_usage,
-                context_budget=args.context_budget,
-                on_trim=print_trim,
-                on_summary=print_summary,
-            )
-            result = agent.run(args.task)
+            workspace = Workspace(copy.root if copy is not None else project)
+            # Started before the first model call, so a Docker problem costs
+            # no requests. Stopped in `finally`, whatever happens in the run.
+            executor = make_executor(args, workspace.root, git_dir=project / ".git")
+            try:
+                subagents = SubAgents(
+                    client,
+                    research_tools(workspace),
+                    context_budget=args.context_budget,
+                    on_tool=print_sub_tool_call,
+                    on_usage=print_sub_step_usage,
+                    on_trim=print_sub_trim,
+                    on_summary=print_sub_summary,
+                )
+                agent = Agent(
+                    client,
+                    tools=[*default_tools(workspace, executor), subagents.tool()],
+                    system=system_prompt(executor),
+                    max_steps=args.max_steps,
+                    on_tool=print_tool_call,
+                    approve=approve,
+                    on_usage=print_step_usage,
+                    context_budget=args.context_budget,
+                    on_trim=print_trim,
+                    on_summary=print_summary,
+                )
+                result = agent.run(args.task)
+            finally:
+                # Before any review: nothing may still be writing to the copy.
+                if isinstance(executor, DockerExecutor):
+                    executor.stop()
+            print_total_usage(result, subagents)
+            print(result.text)
+            finished = True
         finally:
-            if isinstance(executor, DockerExecutor):
-                executor.stop()
-        print_total_usage(result, subagents)
-        print(result.text)
+            if copy is not None:
+                finish_copy(copy, (confirm_apply or ask_to_apply) if finished else None)
         return 0 if result.finished else 1
     except (ConfigError, ModelError, SandboxError) as error:
         print(f"Error: {error}", file=sys.stderr)

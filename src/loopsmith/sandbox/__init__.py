@@ -4,8 +4,10 @@ from loopsmith.sandbox.base import CommandResult, CommandTimedOut, Executor
 from loopsmith.sandbox.docker import DockerExecutor, SandboxError, current_user
 from loopsmith.sandbox.image import IMAGE_DESCRIPTION, ensure_image
 from loopsmith.sandbox.local import LocalExecutor
+from loopsmith.sandbox.working_copy import WorkingCopy
 
 __all__ = [
+    "WorkingCopy",
     "IMAGE_DESCRIPTION",
     "CommandResult",
     "CommandTimedOut",

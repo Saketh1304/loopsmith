@@ -6,6 +6,7 @@ tested in test_docker_live.py, which only runs when asked to.
 """
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -297,6 +298,22 @@ def test_the_git_history_is_mounted_read_only(tmp_path):
     assert f"{tmp_path / '.git'}:/workspace/.git:ro" in mounts(docker.last("run"))
 
 
+def test_the_history_can_come_from_another_folder(tmp_path):
+    # A working copy has no .git of its own; the project's is shown instead.
+    project = tmp_path / "project"
+    (project / ".git").mkdir(parents=True)
+    copy_root = tmp_path / "copy"
+    copy_root.mkdir()
+    docker = FakeDocker()
+
+    executor(copy_root, docker, git_dir=project / ".git").start()
+
+    assert mounts(docker.last("run")) == [
+        f"{copy_root}:/workspace",
+        f"{project / '.git'}:/workspace/.git:ro",
+    ]
+
+
 def test_a_project_without_secrets_or_git_mounts_only_the_folder(tmp_path):
     docker = FakeDocker()
 
@@ -501,7 +518,11 @@ class FakeSandbox:
     made: list["FakeSandbox"] = []
     fail_to_start = False
 
-    def __init__(self, root, image, user=None, network=False, image_description=None):
+    def __init__(
+        self, root, image, user=None, network=False, image_description=None, git_dir=None
+    ):
+        self.root = root
+        self.git_dir = git_dir
         self.image = image
         self.image_description = image_description
         self.network = network
@@ -634,6 +655,115 @@ def test_the_sandbox_image_can_be_chosen_on_the_command_line(fake_sandbox):
     # about what is inside it.
     assert fake_sandbox.images.calls == 0
     assert box.image_description is None
+
+
+# --- The agent works on a copy (decision 68) ---
+
+
+class ReviewAnswer:
+    """Stands in for the question at the end: records the review shown and
+    gives a scripted answer."""
+
+    def __init__(self, answer: bool):
+        self.answer = answer
+        self.reviews: list[str] = []
+
+    def __call__(self, review: str) -> bool:
+        self.reviews.append(review)
+        return self.answer
+
+
+EDIT_STATS = ToolCall("write_file", {"path": "stats.py", "content": "fixed\n"})
+
+
+def run_sandboxed(tmp_path, answer: bool, client=None):
+    (tmp_path / "stats.py").write_bytes(b"buggy\n")
+    confirm = ReviewAnswer(answer)
+    exit_code = main(
+        ["fix the bug", "--sandbox", "--yes"],
+        client=client or FakeClient([EDIT_STATS, "Done."]),
+        confirm_apply=confirm,
+    )
+    return exit_code, confirm
+
+
+def test_the_agent_and_the_container_work_on_a_copy(fake_sandbox, tmp_path, capsys):
+    exit_code, confirm = run_sandboxed(tmp_path, answer=False)
+
+    assert exit_code == 0
+    [box] = fake_sandbox.made
+    # The container got the copy, and the project's own history.
+    assert box.root != tmp_path
+    assert box.git_dir == tmp_path / ".git"
+    # The agent's edit is in the copy; the project is untouched.
+    assert (tmp_path / "stats.py").read_bytes() == b"buggy\n"
+    assert (box.root / "stats.py").read_bytes() == b"fixed\n"
+    err = capsys.readouterr().err
+    assert "working on a copy of the project (1 files)" in err
+    assert f"not applied. The changes are kept in {box.root}" in err
+    shutil.rmtree(box.root)
+
+
+def test_the_review_shows_the_diff_before_asking(fake_sandbox, tmp_path):
+    _, confirm = run_sandboxed(tmp_path, answer=False)
+
+    [review] = confirm.reviews
+    assert review.startswith("Changes made in the copy (1 changed):")
+    assert "-buggy" in review
+    assert "+fixed" in review
+    shutil.rmtree(fake_sandbox.made[0].root)
+
+
+def test_applying_at_the_end_changes_the_project(fake_sandbox, tmp_path, capsys):
+    exit_code, _ = run_sandboxed(tmp_path, answer=True)
+
+    assert exit_code == 0
+    assert (tmp_path / "stats.py").read_bytes() == b"fixed\n"
+    assert "applied 1 of 1 changes" in capsys.readouterr().err
+    assert not fake_sandbox.made[0].root.exists()  # the copy is cleaned up
+
+
+def test_no_changes_means_no_question(fake_sandbox, tmp_path, capsys):
+    confirm = ReviewAnswer(True)
+
+    main(["hi", "--sandbox"], client=FakeClient(["Hi."]), confirm_apply=confirm)
+
+    assert confirm.reviews == []
+    assert "no changes to apply" in capsys.readouterr().err
+    assert not fake_sandbox.made[0].root.exists()
+
+
+def test_a_run_that_stops_early_applies_nothing_and_keeps_the_changes(
+    fake_sandbox, tmp_path, capsys
+):
+    class FailsAfterTheEdit(FakeClient):
+        def generate(self, messages, system=None, tools=None):
+            if self.calls:
+                raise ModelError("quota used up", status=429)
+            return super().generate(messages, system=system, tools=tools)
+
+    exit_code, confirm = run_sandboxed(
+        tmp_path, answer=True, client=FailsAfterTheEdit([EDIT_STATS])
+    )
+
+    assert exit_code == 1
+    assert confirm.reviews == []  # nobody is asked about a half-finished run
+    assert (tmp_path / "stats.py").read_bytes() == b"buggy\n"
+    copy_root = fake_sandbox.made[0].root
+    assert (copy_root / "stats.py").read_bytes() == b"fixed\n"  # nothing is lost
+    err = capsys.readouterr().err
+    assert f"the run stopped early, so nothing was applied. The changes so far are in {copy_root}" in err
+    assert "Error: quota used up" in err
+    shutil.rmtree(copy_root)
+
+
+def test_without_the_sandbox_there_is_no_copy(fake_sandbox, tmp_path, capsys):
+    (tmp_path / "stats.py").write_bytes(b"buggy\n")
+
+    main(["fix the bug", "--yes"], client=FakeClient([EDIT_STATS, "Done."]))
+
+    assert (tmp_path / "stats.py").read_bytes() == b"fixed\n"
+    assert "working on a copy" not in capsys.readouterr().err
 
 
 def test_the_container_is_stopped_even_when_the_run_fails(fake_sandbox):
