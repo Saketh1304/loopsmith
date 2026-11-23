@@ -2,7 +2,7 @@ import io
 
 import pytest
 
-from loopsmith.cli import ask_on_terminal, main, system_prompt
+from loopsmith.cli import ask_on_terminal, cached_note, main, system_prompt
 from loopsmith.config import API_KEY_VAR
 from loopsmith.llm import Message, ModelError, ModelReply, ToolCall, Usage
 from loopsmith.llm.fake import FakeClient
@@ -191,9 +191,34 @@ def test_token_usage_goes_to_stderr_not_stdout(monkeypatch, tmp_path, capsys):
     captured = capsys.readouterr()
     assert exit_code == 0
     assert captured.out.strip() == "All done."
+    # A step with nothing cached says nothing about the cache.
     assert "step 1: 1,500 tokens in, 20 out" in captured.err
-    assert "step 2: 1,800 tokens in, 40 out" in captured.err
-    assert "tokens: 3,300 in (1,200 cached), 60 out; last request 1,800" in captured.err
+    assert "step 2: 1,800 tokens in (1,200 cached), 40 out" in captured.err
+    # 1,200 of 3,300 is 36%.
+    assert "tokens: 3,300 in (1,200 cached, 36%), 60 out; last request 1,800" in captured.err
+
+
+def test_the_cached_count_is_shown_only_when_something_was_cached():
+    assert cached_note(Usage(1_000, 10)) == ""
+    assert cached_note(Usage(9_000, 10, cached_tokens=5_120)) == " (5,120 cached)"
+
+
+def test_a_sub_agent_step_shows_its_cached_tokens(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    ask = ToolCall("delegate", {"task": "Anything here?"})
+    client = FakeClient(
+        [
+            ModelReply("", (ask,), usage=Usage(1_000, 10)),
+            ModelReply("Nothing.", usage=Usage(900, 20, cached_tokens=600)),
+            ModelReply("Done.", usage=Usage(1_100, 15)),
+        ]
+    )
+
+    main(["look"], client=client)
+
+    assert "      .. sub-agent step 1: 900 tokens in (600 cached), 20 out" in (
+        capsys.readouterr().err
+    )
 
 
 def test_no_usage_line_when_the_model_reports_no_counts(monkeypatch, tmp_path, capsys):
@@ -221,6 +246,8 @@ def test_trimming_is_reported_on_stderr(monkeypatch, tmp_path, capsys):
     assert exit_code == 0
     assert captured.out.strip() == "Done."
     assert "trimmed 1 old tool result, about" in captured.err
+    assert "the next request re-reads about" in captured.err
+    assert "tokens without the cache" in captured.err
     first_result = next(m for m in client.calls[-1][0] if m.role == "tool")
     assert first_result.tool_results[0].content.startswith("[Old output removed")
 
@@ -261,9 +288,9 @@ def test_summarising_is_reported_on_stderr(monkeypatch, tmp_path, capsys):
     assert exit_code == 0
     assert captured.out.strip() == "Done."
     assert (
-        "summarised 4 old messages (one extra model call: 700 tokens in, 40 out)"
-        in captured.err
-    )
+        "summarised 4 old messages (one extra model call: 700 tokens in, 40 out); "
+        "the next request re-reads the whole history without the cache"
+    ) in captured.err
     assert "The file is all y." in client.calls[-1][0][0].text
 
 

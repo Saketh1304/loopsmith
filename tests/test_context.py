@@ -154,6 +154,28 @@ def test_an_already_trimmed_result_is_not_trimmed_again():
     assert report == TrimReport()
 
 
+def test_a_trim_reports_the_history_after_it_as_no_longer_cached():
+    # Messages: 0 task, 1-2 first turn, 3-4 second turn (the big result), ...
+    messages = history("a", BIG, "c", "d", "e")
+
+    trimmed, report = trim_history(messages, tokens_to_free=100)
+
+    # The cache still covers everything before the trimmed result. From
+    # that result to the end, the next request has changed.
+    assert result_texts(trimmed)[1].startswith("[Old output removed")
+    assert report.uncached_tokens == estimate_history_tokens(trimmed[4:])
+    assert 0 < report.uncached_tokens < estimate_history_tokens(trimmed)
+
+
+def test_the_cache_is_lost_from_the_first_trimmed_result_not_the_last():
+    messages = history(BIG, BIG, "c", "d", "e")
+
+    trimmed, report = trim_history(messages, tokens_to_free=1_000_000)
+
+    assert report.results_trimmed == 2
+    assert report.uncached_tokens == estimate_history_tokens(trimmed[2:])
+
+
 def test_the_trim_target_is_half_the_budget():
     assert trim_target(30_000) == 15_000
 

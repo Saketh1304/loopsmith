@@ -103,10 +103,19 @@ def print_sub_tool_call(call: ToolCall, result: ToolResult) -> None:
     print_tool_call(call, result, indent=SUB_INDENT)
 
 
+def cached_note(usage: Usage) -> str:
+    """Say how much of a request came from the provider's cache.
+
+    Gives text such as " (5,120 cached)", or nothing when none of it was
+    cached (Gemini then leaves the count out of its reply).
+    """
+    return f" ({usage.cached_tokens:,} cached)" if usage.cached_tokens else ""
+
+
 def print_sub_step_usage(step: int, usage: Usage) -> None:
     print(
-        f"{SUB_INDENT}.. sub-agent step {step}: {usage.input_tokens:,} tokens in, "
-        f"{usage.output_tokens:,} out",
+        f"{SUB_INDENT}.. sub-agent step {step}: {usage.input_tokens:,} tokens in"
+        f"{cached_note(usage)}, {usage.output_tokens:,} out",
         file=sys.stderr,
     )
 
@@ -120,19 +129,24 @@ def print_retry(error: ModelError, delay: float, attempt: int) -> None:
 
 
 def print_step_usage(step: int, usage: Usage) -> None:
-    """Show how big each request was, so the history can be seen growing."""
+    """Show how big each request was, so the history can be seen growing,
+    and how much of it the provider read from its cache."""
     print(
-        f"  .. step {step}: {usage.input_tokens:,} tokens in, "
+        f"  .. step {step}: {usage.input_tokens:,} tokens in{cached_note(usage)}, "
         f"{usage.output_tokens:,} out",
         file=sys.stderr,
     )
 
 
 def print_trim(report: TrimReport) -> None:
+    """Show what a trim saved, and what it costs: the cache only covers a
+    request up to its first change, so everything after the first trimmed
+    result is sent once more without the cache's discount."""
     noun = "result" if report.results_trimmed == 1 else "results"
     print(
         f"  .. trimmed {report.results_trimmed} old tool {noun}, "
-        f"about {report.tokens_freed:,} tokens",
+        f"about {report.tokens_freed:,} tokens; the next request re-reads "
+        f"about {report.uncached_tokens:,} tokens without the cache",
         file=sys.stderr,
     )
 
@@ -150,8 +164,11 @@ def print_summary(report: SummaryReport) -> None:
             f" (one extra model call: {report.usage.input_tokens:,} tokens in, "
             f"{report.usage.output_tokens:,} out)"
         )
+    # The summary goes into the first message, so the whole history after
+    # the system prompt and tools changes, and none of it is cached.
     print(
-        f"  .. summarised {report.messages_replaced} old messages{cost}",
+        f"  .. summarised {report.messages_replaced} old messages{cost}; "
+        "the next request re-reads the whole history without the cache",
         file=sys.stderr,
     )
 
@@ -165,8 +182,13 @@ def print_total_usage(result: AgentResult, subagents: SubAgents) -> None:
     usage = result.usage + subagents.usage
     if usage == Usage():
         return
+    cached = f"{usage.cached_tokens:,} cached"
+    if usage.cached_tokens and usage.input_tokens:
+        # The share of all input the provider read from its cache: the one
+        # number that says whether caching is working for this run.
+        cached += f", {round(100 * usage.cached_tokens / usage.input_tokens)}%"
     line = (
-        f"  tokens: {usage.input_tokens:,} in ({usage.cached_tokens:,} cached), "
+        f"  tokens: {usage.input_tokens:,} in ({cached}), "
         f"{usage.output_tokens:,} out; last request {result.context_tokens:,}"
     )
     if subagents.runs:

@@ -68,6 +68,11 @@ class SummaryReport:
 class TrimReport:
     results_trimmed: int = 0
     tokens_freed: int = 0  # an estimate, from CHARS_PER_TOKEN
+    # The provider's cache only covers the start of a request, up to the
+    # first change. This estimates the history from the first trimmed
+    # result to the end: the part the next request sends without the
+    # cache's discount.
+    uncached_tokens: int = 0
 
 
 def estimate_tokens(text: str) -> int:
@@ -106,6 +111,7 @@ def trim_history(
     trimmed = list(messages)
     count = 0
     freed = 0
+    first_changed = None  # where the cached start of the request ends
     for position in eligible:
         if freed >= tokens_to_free:
             break
@@ -115,13 +121,17 @@ def trim_history(
                 note = _note_for(result)
                 freed += estimate_tokens(result.content) - estimate_tokens(note)
                 count += 1
+                if first_changed is None:
+                    first_changed = position
                 # `replace` copies a frozen dataclass with one field
                 # changed, like a "wither" method on a Java record.
                 result = replace(result, content=note)
             results.append(result)
         trimmed[position] = replace(messages[position], tool_results=tuple(results))
 
-    return trimmed, TrimReport(results_trimmed=count, tokens_freed=freed)
+    uncached = 0 if first_changed is None else estimate_history_tokens(trimmed[first_changed:])
+    report = TrimReport(results_trimmed=count, tokens_freed=freed, uncached_tokens=uncached)
+    return trimmed, report
 
 
 def _note_for(result: ToolResult) -> str:
