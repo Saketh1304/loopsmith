@@ -142,12 +142,25 @@ class DockerExecutor:
         image = f"Docker image {self._image}"
         if self._image_description:
             image += f": {self._image_description}"
+        if self._shows_git_history():
+            git = "The .git folder is read-only"
+        else:
+            # Without this, the model may run `git diff` to check its work and
+            # get 7,000 characters of git's usage text back (decision 71).
+            git = "There is no git history, so git commands such as git diff fail"
         return (
             f"inside a Linux container ({image}) through sh. "
             f"It has {network}, at most {MEMORY_LIMIT_TEXT} of memory, and only "
-            "the project folder and /tmp can be written to. The .git folder is "
-            "read-only, and .env files look empty"
+            f"the project folder and /tmp can be written to. {git}, and .env "
+            "files look empty"
         )
+
+    def _shows_git_history(self) -> bool:
+        """Whether the container gets a .git folder. The mounts and the text
+        for the model both ask this, so they cannot disagree. There is none
+        when loopsmith runs in a subfolder of a repository: the history is
+        further up, outside the folder the container sees."""
+        return self._git_dir.exists()
 
     def _mounts(self) -> list[str]:
         """The project folder, with its history and its secrets protected.
@@ -156,11 +169,10 @@ class DockerExecutor:
         the container they replace what the folder has at those paths.
         """
         args = ["--volume", f"{self._root}:{CONTAINER_WORKDIR}"]
-        git = self._git_dir
-        if git.exists():
+        if self._shows_git_history():
             # Commands can still read the history (git log, git diff) but not
             # change or delete it, so the user can always get files back.
-            args += ["--volume", f"{git}:{CONTAINER_WORKDIR}/.git:ro"]
+            args += ["--volume", f"{self._git_dir}:{CONTAINER_WORKDIR}/.git:ro"]
         secrets = find_secret_files(self._root)
         self._remove_empty_file()  # never leave an old one behind
         if secrets:

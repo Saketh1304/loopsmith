@@ -400,9 +400,40 @@ def test_a_replaced_container_hides_the_secrets_too(tmp_path):
 
 
 def test_where_tells_the_model_about_git_and_env_files(tmp_path):
+    (tmp_path / ".git").mkdir()
+
     where = executor(tmp_path, FakeDocker()).where
 
     assert "The .git folder is read-only, and .env files look empty" in where
+
+
+def test_where_says_there_is_no_git_history_when_none_is_mounted(tmp_path):
+    # As in a subfolder of a repository (examples/buggy_stats): the history
+    # is further up, outside what the container sees. A live run spent a
+    # step on `git diff` because the prompt said there was a .git folder.
+    docker = FakeDocker()
+    box = executor(tmp_path, docker)
+
+    box.start()
+
+    assert not any(m.endswith("/.git:ro") for m in mounts(docker.last("run")))
+    assert "There is no git history, so git commands such as git diff fail" in box.where
+    assert "The .git folder" not in box.where
+    assert ".env files look empty" in box.where
+    box.stop()
+
+
+def test_where_follows_the_history_shown_not_the_folder(tmp_path):
+    # A working copy has no .git of its own, but the project's is mounted.
+    project = tmp_path / "project"
+    (project / ".git").mkdir(parents=True)
+    copy_root = tmp_path / "copy"
+    copy_root.mkdir()
+
+    where = executor(copy_root, FakeDocker(), git_dir=project / ".git").where
+
+    assert "The .git folder is read-only" in where
+    assert "no git history" not in where
 
 
 # --- When Docker cannot start it ---
